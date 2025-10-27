@@ -261,7 +261,25 @@ async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str
                     "messages": [
                         {
                             "role": "system",
-                            "content": """You are an AI that analyzes job application form screenshots and outputs STRICT JSON only. Never use markdown fences. Use the candidate CV text to infer missing values. Prefer label-based actions using accessible names (as visible on the form). If a CAPTCHA iframe is present, set captcha_type to 'iframe'."""
+                            "content": """You are an AI that analyzes job application screenshots. Return STRICT JSON (no markdown fences).
+
+FORMAT:
+{
+  "success": true/false,
+  "reason": "explanation",
+  "instructions": [
+    {"action": "fill", "selector": "Field Label Text", "value": "derived from CV"},
+    {"action": "select", "selector": "Dropdown Label", "value": "Yes/No"},
+    {"action": "check", "selector": "Checkbox Label"}
+  ],
+  "captcha_type": "iframe" (if present)
+}
+
+RULES:
+- Use EXACT label text visible on form for "selector"
+- Derive all values from CV when fields empty
+- actions: fill, select, check, click
+- Always infer job_title, legal_name, city from CV"""
                         },
                         {
                             "role": "user",
@@ -347,154 +365,256 @@ async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str
         return {"success": False, "reason": str(e), "instructions": []}
 
 
-async def execute_vision_instructions(page, instructions: List[str], messages: List[str]) -> bool:
+async def execute_vision_instructions(page, instructions: List[object], messages: List[str]) -> bool:
     """
-    Executa as instruções fornecidas pelo Vision API
+    Executa as instruções fornecidas pelo Vision.
+    Suporta tanto strings como objetos {action, selector, value} e prioriza seletores por label.
     """
     if not instructions:
         return False
-    
+
     log_message(messages, f"🔧 Executando {len(instructions)} instruções do Vision...")
     executed_count = 0
-    
+
+    async def fill_by_label(label_text: str, value: str) -> bool:
+        try:
+            el = page.get_by_label(label_text)
+            await el.wait_for(state="visible", timeout=3000)
+            try:
+                await el.fill(str(value))
+                return True
+            except Exception:
+                # Tentar como <select>
+                try:
+                    await el.select_option(label=str(value))
+                    return True
+                except Exception:
+                    try:
+                        await el.select_option(str(value))
+                        return True
+                    except Exception:
+                        return False
+        except Exception:
+            return False
+
+    async def check_by_label(label_text: str) -> bool:
+        try:
+            await page.get_by_label(label_text).check(timeout=3000)
+            return True
+        except Exception:
+            return False
+
+    async def click_by_name(name: str) -> bool:
+        try:
+            await page.get_by_role("button", name=name).first.click(timeout=3000)
+            return True
+        except Exception:
+            try:
+                await page.get_by_role("link", name=name).first.click(timeout=3000)
+                return True
+            except Exception:
+                try:
+                    await page.locator(f"button:has-text('{name}'), a:has-text('{name}')").first.click(timeout=3000)
+                    return True
+                except Exception:
+                    return False
+
     for i, instruction in enumerate(instructions, 1):
         try:
+            # Instrução como dict estruturado
+            if isinstance(instruction, dict):
+                action = str(instruction.get("action", "")).lower()
+                selector = instruction.get("selector") or instruction.get("field") or ""
+                value = instruction.get("value") or instruction.get("answer") or ""
+                log_message(messages, f"  [{i}] Executando: {instruction}")
+
+                if action in ["fill", "type"] and selector:
+                    # 1) tentar por label
+                    if await fill_by_label(selector, value):
+                        log_message(messages, f"    ✓ Preenchido por label: {selector} -> {value}")
+                        executed_count += 1
+                        await asyncio.sleep(random.uniform(0.4, 0.8))
+                        continue
+                    # 2) fallback: CSS direto
+                    try:
+                        if await fill_field(page, str(selector), str(value), messages):
+                            executed_count += 1
+                            await asyncio.sleep(random.uniform(0.4, 0.8))
+                            continue
+                    except Exception:
+                        pass
+
+                if action in ["select", "choose"] and selector:
+                    ok_sel = False
+                    # 1) label
+                    try:
+                        el = page.get_by_label(selector)
+                        await el.select_option(label=str(value))
+                        ok_sel = True
+                    except Exception:
+                        try:
+                            el = page.get_by_label(selector)
+                            await el.select_option(str(value))
+                            ok_sel = True
+                        except Exception:
+                            try:
+                                await page.locator(str(selector)).first.select_option(label=str(value))
+                                ok_sel = True
+                            except Exception:
+                                ok_sel = False
+                    if ok_sel:
+                        log_message(messages, f"    ✓ Dropdown por label: {selector} = {value}")
+                        executed_count += 1
+                        await asyncio.sleep(random.uniform(0.4, 0.8))
+                        continue
+
+                if action in ["check", "tick"] and selector:
+                    if await check_by_label(selector):
+                        log_message(messages, f"    ✓ Marcado por label: {selector}")
+                        executed_count += 1
+                        await asyncio.sleep(random.uniform(0.3, 0.6))
+                        continue
+                    try:
+                        await page.locator(str(selector)).first.check(timeout=3000)
+                        log_message(messages, f"    ✓ Marcado: {selector}")
+                        executed_count += 1
+                        await asyncio.sleep(random.uniform(0.3, 0.6))
+                        continue
+                    except Exception:
+                        pass
+
+                if action in ["click", "press"]:
+                    target = str(selector or value)
+                    if await click_by_name(target):
+                        log_message(messages, f"    ✓ Click por nome: {target}")
+                        executed_count += 1
+                        await asyncio.sleep(random.uniform(0.3, 0.6))
+                        continue
+                    try:
+                        await page.locator(target).first.click(timeout=3000)
+                        log_message(messages, f"    ✓ Click por seletor: {target}")
+                        executed_count += 1
+                        await asyncio.sleep(random.uniform(0.3, 0.6))
+                        continue
+                    except Exception:
+                        pass
+
+            # Instrução como string (compat)
+            text = str(instruction)
             # Skip unsolvable iframe CAPTCHAs only
-            if "UNSOLVABLE_IFRAME" in instruction:
+            if "UNSOLVABLE_IFRAME" in text:
                 log_message(messages, f"  [{i}] ⚠ CAPTCHA iframe não pode ser resolvido - a pular")
                 continue
-            
-            log_message(messages, f"  [{i}] Executando: {instruction}")
-            
-            # Parse instruction and execute
-            instruction_lower = instruction.lower()
-            
-            # Handle CAPTCHA image clicks by position
-            if "click captcha image at position" in instruction_lower:
-                match = re.search(r"position\s*\((\d+),\s*(\d+)\)", instruction)
+
+            log_message(messages, f"  [{i}] Executando: {text}")
+            lower = text.lower()
+
+            # CAPTCHA image grid
+            if "click captcha image at position" in lower:
+                match = re.search(r"position\s*\((\d+),\s*(\d+)\)", text)
                 if match:
                     row, col = int(match.group(1)), int(match.group(2))
                     try:
-                        # Find CAPTCHA grid container and click specific image
-                        # Most captchas use grid layout, so we calculate nth-child
-                        # Assuming 3 columns per row (adjust if needed)
                         cols_per_row = 3
                         image_index = (row - 1) * cols_per_row + col
-                        
-                        # Try multiple selectors for captcha images
                         selectors = [
                             f".captcha-grid img:nth-child({image_index})",
                             f"[class*='captcha'] img:nth-child({image_index})",
                             f"img[alt*='captcha']:nth-child({image_index})",
                             f".rc-imageselect-tile:nth-child({image_index})",
                         ]
-                        
                         clicked = False
-                        for selector in selectors:
+                        for sel in selectors:
                             try:
-                                el = page.locator(selector).first
+                                el = page.locator(sel).first
                                 if await el.count() > 0:
                                     await el.click(timeout=2000)
-                                    log_message(messages, f"    ✓ Clicou em imagem CAPTCHA ({row},{col})")
+                                    log_message(messages, f"    ✓ Clicou CAPTCHA ({row},{col})")
                                     clicked = True
                                     executed_count += 1
                                     break
-                            except:
+                            except Exception:
                                 continue
-                        
                         if not clicked:
-                            # Fallback: get all images and click by index
                             all_imgs = page.locator("img")
                             count = await all_imgs.count()
                             if image_index <= count:
                                 await all_imgs.nth(image_index - 1).click(timeout=2000)
-                                log_message(messages, f"    ✓ Clicou em imagem CAPTCHA ({row},{col}) via fallback")
+                                log_message(messages, f"    ✓ Clicou CAPTCHA ({row},{col}) via fallback")
                                 executed_count += 1
                     except Exception as e:
                         log_message(messages, f"    ✗ Falha ao clicar em CAPTCHA image: {e}")
                 continue
-            
-            # Handle CAPTCHA submit button
-            if "click captcha submit" in instruction_lower:
+
+            if "click captcha submit" in lower:
                 try:
-                    selectors = [
+                    for sel in [
                         "button:has-text('Submit')",
                         "button:has-text('Verify')",
                         "[class*='captcha'] button[type='submit']",
                         ".captcha-submit",
-                        "#captcha-submit"
-                    ]
-                    for selector in selectors:
+                        "#captcha-submit",
+                    ]:
                         try:
-                            btn = page.locator(selector).first
+                            btn = page.locator(sel).first
                             if await btn.is_visible(timeout=2000):
                                 await btn.click()
-                                log_message(messages, f"    ✓ Clicou em botão submit do CAPTCHA")
+                                log_message(messages, f"    ✓ Clicou submit CAPTCHA")
                                 executed_count += 1
                                 break
-                        except:
+                        except Exception:
                             continue
                 except Exception as e:
                     log_message(messages, f"    ✗ Falha ao clicar submit CAPTCHA: {e}")
                 continue
-            
-            if "select option" in instruction_lower and "dropdown" in instruction_lower:
-                # Extract option value and dropdown identifier
-                match = re.search(r"select option ['\"](.+?)['\"] in dropdown\s*(?:\[name=['\"](.+?)['\"]\]|['\"](.+?)['\"])", instruction, re.IGNORECASE)
+
+            if "select option" in lower and "dropdown" in lower:
+                match = re.search(r"select option ['\"](.+?)['\"] in dropdown\s*(?:\[name=['\"](.+?)['\"]\]|['\"](.+?)['\"])", text, re.IGNORECASE)
                 if match:
                     option_value = match.group(1)
                     dropdown_name = match.group(2) or match.group(3)
-                    
                     try:
-                        # Try by name attribute first
-                        if match.group(2):
-                            select_el = page.locator(f"select[name='{dropdown_name}']")
-                        else:
-                            # Try by label text
-                            label = page.locator(f"label:has-text('{dropdown_name}')")
-                            select_id = await label.get_attribute("for") if await label.count() > 0 else None
-                            if select_id:
-                                select_el = page.locator(f"select#{select_id}")
-                            else:
-                                # Fallback: any select near the label
-                                select_el = page.locator("select").first
-                        
-                        await select_el.select_option(label=option_value, timeout=3000)
+                        try:
+                            await page.get_by_label(dropdown_name).select_option(label=option_value)
+                        except Exception:
+                            await page.locator(f"select[name='{dropdown_name}']").first.select_option(label=option_value)
                         log_message(messages, f"    ✓ Dropdown selecionado: {option_value}")
                         executed_count += 1
                     except Exception as e:
                         log_message(messages, f"    ✗ Falha ao selecionar dropdown: {e}")
-                        
-            elif "fill" in instruction_lower:
-                # Extract selector and value
-                match = re.search(r"fill\s+(.+?)\s+with\s+(?:value\s+)?['\"](.+?)['\"]", instruction, re.IGNORECASE)
+
+            elif "fill" in lower:
+                match = re.search(r"fill\s+(.+?)\s+with\s+(?:value\s+)?['\"](.+?)['\"]", text, re.IGNORECASE)
                 if match:
-                    selector, value = match.groups()
-                    if await fill_field(page, selector.strip(), value.strip(), messages):
-                        executed_count += 1
-                    
-            elif "click" in instruction_lower:
-                # Extract what to click
-                match = re.search(r"click\s+(.+)", instruction, re.IGNORECASE)
+                    selector_or_label, value = match.groups()
+                    # se tiver aspas, assumir label
+                    quoted = re.search(r"['\"](.+?)['\"]", selector_or_label)
+                    if quoted:
+                        if await fill_by_label(quoted.group(1), value):
+                            log_message(messages, f"    ✓ Preenchido por label: {quoted.group(1)}")
+                            executed_count += 1
+                    else:
+                        if await fill_field(page, selector_or_label.strip(), value.strip(), messages):
+                            executed_count += 1
+
+            elif "click" in lower:
+                match = re.search(r"click\s+(.+)", text, re.IGNORECASE)
                 if match:
                     target = match.group(1).strip()
-                    try:
-                        # Try to click by text first
-                        if "text" in target.lower() or "'" in target or '"' in target:
-                            text = re.search(r"['\"](.+?)['\"]", target)
-                            if text:
-                                btn = page.locator(f"button:has-text('{text.group(1)}'), a:has-text('{text.group(1)}')")
-                                await btn.first.click(timeout=3000)
-                        else:
-                            # Try as selector
+                    quoted = re.search(r"['\"](.+?)['\"]", target)
+                    if quoted:
+                        if await click_by_name(quoted.group(1)):
+                            executed_count += 1
+                    else:
+                        try:
                             await page.locator(target).first.click(timeout=3000)
-                        log_message(messages, f"    ✓ Clicou em: {target[:40]}")
-                        executed_count += 1
-                    except Exception as e:
-                        log_message(messages, f"    ✗ Falha ao clicar: {e}")
-                        
-            elif "select" in instruction_lower:
-                match = re.search(r"select\s+(?:option\s+)?['\"](.+?)['\"]\s+in\s+(.+)", instruction, re.IGNORECASE)
+                            log_message(messages, f"    ✓ Clicou em: {target[:40]}")
+                            executed_count += 1
+                        except Exception as e:
+                            log_message(messages, f"    ✗ Falha ao clicar: {e}")
+
+            elif "select" in lower:
+                match = re.search(r"select\s+(?:option\s+)?['\"](.+?)['\"]\s+in\s+(.+)", text, re.IGNORECASE)
                 if match:
                     value, selector = match.groups()
                     try:
@@ -503,23 +623,28 @@ async def execute_vision_instructions(page, instructions: List[str], messages: L
                         executed_count += 1
                     except Exception as e:
                         log_message(messages, f"    ✗ Falha ao selecionar: {e}")
-                        
-            elif "check" in instruction_lower:
-                match = re.search(r"check\s+(.+)", instruction, re.IGNORECASE)
+
+            elif "check" in lower:
+                match = re.search(r"check\s+(.+)", text, re.IGNORECASE)
                 if match:
                     selector = match.group(1).strip()
-                    try:
-                        await page.locator(selector).check(timeout=3000)
-                        log_message(messages, f"    ✓ Marcou checkbox: {selector[:40]}")
-                        executed_count += 1
-                    except Exception as e:
-                        log_message(messages, f"    ✗ Falha ao marcar: {e}")
-            
+                    quoted = re.search(r"['\"](.+?)['\"]", selector)
+                    if quoted:
+                        if await check_by_label(quoted.group(1)):
+                            log_message(messages, f"    ✓ Marcou checkbox por label: {quoted.group(1)}")
+                            executed_count += 1
+                    else:
+                        try:
+                            await page.locator(selector).check(timeout=3000)
+                            log_message(messages, f"    ✓ Marcou checkbox: {selector[:40]}")
+                            executed_count += 1
+                        except Exception as e:
+                            log_message(messages, f"    ✗ Falha ao marcar: {e}")
+
             await asyncio.sleep(random.uniform(0.5, 1.0))
-            
         except Exception as e:
             log_message(messages, f"    ✗ Erro ao executar instrução: {e}")
-    
+
     log_message(messages, f"✓ Executadas {executed_count}/{len(instructions)} instruções com sucesso")
     return executed_count > 0
 
@@ -624,8 +749,8 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
             if plan_only:
                 status = "planned_only"
             else:
-                # Self-healing loop com Vision AI (max 3 tentativas)
-                MAX_RETRIES = 3
+                # Self-healing loop com Vision AI (max 10 tentativas)
+                MAX_RETRIES = 10
                 retry_count = 0
                 
                 while retry_count < MAX_RETRIES:
@@ -660,8 +785,10 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     # Detectar sucesso com heurísticas básicas
                     basic_success = await detect_success(page, job_url, messages)
                     
-                    # Analisar com Vision AI
-                    vision_result = await analyze_screenshot_with_vision(screenshot_b64, messages, openai_api_key)
+                    # Analisar com Vision AI (com contexto do CV e dados do utilizador)
+                    vision_result = await analyze_screenshot_with_vision(
+                        screenshot_b64, messages, openai_api_key, user_data.get("__text"), user_data
+                    )
                     
                     # Se Vision confirma sucesso OU heurística detectou
                     if vision_result.get("success") or basic_success:
