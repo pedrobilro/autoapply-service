@@ -8,12 +8,23 @@ import asyncio
 import traceback
 import pdfplumber
 import httpx
+import logging
 
 from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
+
+# --------------------------
+# Logger global
+# --------------------------
+logger = logging.getLogger("auto-apply-playwright")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+    logger.addHandler(handler)
 
 # --------------------------
 # FastAPI app & CORS
@@ -135,7 +146,8 @@ async def fill_field(page, selector: str, value: str, messages: List[str]) -> bo
         return False
     try:
         loc = page.locator(selector).first
-        if await loc.is_visible(timeout=2500):
+        await loc.wait_for(state="visible", timeout=2500)
+        if await loc.is_visible():
             await loc.fill(value)
             log_message(messages, f"✓ Preencheu {selector[:45]} -> '{value[:42]}'")
             await asyncio.sleep(random.uniform(0.3, 0.7))
@@ -149,7 +161,8 @@ async def fill_autocomplete(page, selector: str, value: str, messages: List[str]
         return False
     try:
         loc = page.locator(selector).first
-        if await loc.is_visible(timeout=2500):
+        await loc.wait_for(state="visible", timeout=2500)
+        if await loc.is_visible():
             await loc.click()
             await loc.fill(value)
             await asyncio.sleep(random.uniform(0.4, 0.8))
@@ -183,7 +196,8 @@ async def upload_resume(page, pdf_bytes: Optional[bytes], messages: List[str]) -
 async def try_open_apply_modal(page, messages: List[str]):
     try:
         btn = page.locator(SELECTORS["open_apply"]).first
-        if await btn.is_visible(timeout=2500):
+        await btn.wait_for(state="visible", timeout=2500)
+        if await btn.is_visible():
             await btn.click()
             log_message(messages, "✓ Abriu formulário Apply")
             await asyncio.sleep(1.0)
@@ -765,7 +779,10 @@ async def auto_apply(req: ApplyRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ ERRO CRÍTICO: {type(e).__name__}: {str(e)}", exc_info=True)
+        try:
+            logger.error(f"❌ ERRO CRÍTICO: {type(e).__name__}: {str(e)}", exc_info=True)
+        except Exception:
+            print(f"❌ ERRO CRÍTICO: {type(e).__name__}: {str(e)}", flush=True)
         raise HTTPException(
             status_code=500,
             detail={
