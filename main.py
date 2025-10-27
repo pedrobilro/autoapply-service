@@ -75,6 +75,7 @@ class ApplyRequest(BaseModel):
     resume_b64: Optional[str] = None
     plan_only: bool = False
     allow_submit: bool = True
+    openai_api_key: Optional[str] = None
 
 # --------------------------
 # Helpers
@@ -208,17 +209,16 @@ async def check_required_errors(page, messages: List[str]) -> List[str]:
         log_message(messages, f"⚠ Problemas de validação: {problems}")
     return problems
 
-async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str]) -> Dict:
+async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str], openai_key: Optional[str] = None) -> Dict:
     """
     Envia screenshot para GPT-5 Vision e recebe análise:
     - success: True/False
     - reason: explicação
     - instructions: lista de ações para corrigir (se não foi sucesso)
     """
-    openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
-        log_message(messages, "⚠ OPENAI_API_KEY não configurado - pulando Vision")
-        return {"success": False, "reason": "API key not configured", "instructions": []}
+        log_message(messages, "⚠ OPENAI_API_KEY não fornecida - pulando Vision")
+        return {"success": False, "reason": "API key not provided", "instructions": []}
     
     try:
         log_message(messages, "🔍 Analisando screenshot com GPT-5 Vision...")
@@ -574,6 +574,7 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
     job_url = user_data.get("job_url", "")
     plan_only = bool(user_data.get("plan_only", False))
     allow_submit = bool(user_data.get("allow_submit", True))
+    openai_api_key = user_data.get("openai_api_key")
 
     pdf_bytes = await load_resume_bytes(user_data.get("resume_url"), user_data.get("resume_b64"))
     if pdf_bytes:
@@ -673,7 +674,7 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     basic_success = await detect_success(page, job_url, messages)
                     
                     # Analisar com Vision AI
-                    vision_result = await analyze_screenshot_with_vision(screenshot_b64, messages)
+                    vision_result = await analyze_screenshot_with_vision(screenshot_b64, messages, openai_api_key)
                     
                     # Se Vision confirma sucesso OU heurística detectou
                     if vision_result.get("success") or basic_success:
