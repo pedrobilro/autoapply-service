@@ -16,22 +16,22 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 
+# --------------------------
+# Logger global
+# --------------------------
+logger = logging.getLogger("auto-apply-playwright")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
 try:
     from python_anticaptcha import AnticaptchaClient, NoCaptchaTaskProxylessTask
     ANTICAPTCHA_AVAILABLE = True
 except ImportError:
     ANTICAPTCHA_AVAILABLE = False
     logger.warning("python-anticaptcha não disponível - resolução de CAPTCHA desabilitada")
-
-# --------------------------
-# Logger global
-# --------------------------
-logger = logging.getLogger("auto-apply-playwright")
-if not logger.handlers:
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
-    logger.addHandler(handler)
 
 # --------------------------
 # FastAPI app & CORS
