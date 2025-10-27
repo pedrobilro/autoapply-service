@@ -150,8 +150,9 @@ async def fill_field(page, selector: str, value: str, messages: List[str]) -> bo
         return False
     try:
         loc = page.locator(selector).first
-        await loc.wait_for(state="visible", timeout=2500)
+        await loc.wait_for(state="visible", timeout=8000)
         if await loc.is_visible():
+            await loc.scroll_into_view_if_needed()
             await loc.fill(value)
             log_message(messages, f"✓ Preencheu {selector[:45]} -> '{value[:42]}'")
             await asyncio.sleep(random.uniform(0.3, 0.7))
@@ -228,21 +229,96 @@ async def check_required_errors(page, messages: List[str]) -> List[str]:
     return problems
 
 async def fill_by_possible_labels(page, labels: List[str], value: str, messages: List[str]) -> bool:
+    """Tenta preencher campo por vários labels possíveis"""
     if not value:
         return False
     for lb in labels:
         try:
             el = page.get_by_label(lb)
-            await el.fill(value, timeout=1200)
+            await el.fill(value, timeout=8000)
             log_message(messages, f"✓ Preenchido por label '{lb}' -> '{value[:40]}'")
             return True
         except Exception:
             continue
     return False
 
+async def fill_autocomplete_location(page, location: str, messages: List[str]) -> bool:
+    """Preenche campo de localização com autocomplete (tipo Greenhouse)"""
+    if not location:
+        return False
+    
+    try:
+        # Tenta encontrar o campo de localização
+        city_selectors = [
+            "input[aria-label*='Location' i]",
+            "input[aria-label*='City' i]",
+            "input[name*='location' i]",
+            "input[placeholder*='location' i]",
+            "[role='combobox'][aria-label*='Location' i]"
+        ]
+        
+        for selector in city_selectors:
+            try:
+                city_field = page.locator(selector).first
+                if await city_field.is_visible(timeout=3000):
+                    # Scroll e clica no campo
+                    await city_field.scroll_into_view_if_needed()
+                    await city_field.click(timeout=5000)
+                    await asyncio.sleep(0.3)
+                    
+                    # Preenche o valor
+                    await city_field.fill(location, timeout=8000)
+                    await asyncio.sleep(0.5)
+                    
+                    # Tenta selecionar da dropdown (ArrowDown + Enter)
+                    try:
+                        await page.wait_for_selector('[role="listbox"], [role="list"], .dropdown-menu', timeout=3000)
+                        await asyncio.sleep(0.3)
+                        await page.keyboard.press("ArrowDown")
+                        await asyncio.sleep(0.2)
+                        await page.keyboard.press("Enter")
+                        log_message(messages, f"✓ Location selecionada via dropdown: {location}")
+                        return True
+                    except Exception:
+                        # Se não houver dropdown, apenas Enter
+                        await page.keyboard.press("Enter")
+                        log_message(messages, f"✓ Location preenchida (sem dropdown): {location}")
+                        return True
+            except Exception:
+                continue
+        
+        log_message(messages, "⚠ Campo Location não encontrado com seletores específicos")
+        return False
+    except Exception as e:
+        log_message(messages, f"✗ Erro ao preencher Location: {e}")
+        return False
+
+async def expand_collapsed_sections(page, messages: List[str]):
+    """Expande secções colapsadas (Additional Information, etc.)"""
+    toggle_texts = ["Additional", "More", "Details", "Optional", "Informação Adicional"]
+    expanded = 0
+    
+    for txt in toggle_texts:
+        try:
+            toggles = page.get_by_role("button", name=re.compile(txt, re.I))
+            count = await toggles.count()
+            for i in range(count):
+                toggle = toggles.nth(i)
+                if await toggle.is_visible(timeout=1000):
+                    await toggle.scroll_into_view_if_needed()
+                    await toggle.click(timeout=2000)
+                    expanded += 1
+                    await asyncio.sleep(0.3)
+        except Exception:
+            continue
+    
+    if expanded:
+        log_message(messages, f"✓ Expandidas {expanded} secções colapsadas")
+    return expanded
+
 async def autofix_required_fields(page, messages: List[str]) -> int:
     fixed = 0
-    # Dropdowns obrigatórios
+    # Dropdowns obrigatórios (HTML select)
     try:
         selects = page.locator("select[required], select[aria-required='true']")
         count = await selects.count()
@@ -264,6 +340,27 @@ async def autofix_required_fields(page, messages: List[str]) -> int:
                             break
                         except Exception:
                             continue
+    except Exception:
+        pass
+
+    # Combobox customizados (tipo React-Select) - usar click + keyboard
+    try:
+        comboboxes = page.locator("[role='combobox'][aria-required='true'], [role='combobox'][required]")
+        cbo_count = await comboboxes.count()
+        for i in range(cbo_count):
+            cbo = comboboxes.nth(i)
+            try:
+                await cbo.scroll_into_view_if_needed()
+                await cbo.click(timeout=3000)
+                await asyncio.sleep(0.3)
+                # Escolhe primeira opção visível
+                await page.keyboard.press("ArrowDown")
+                await asyncio.sleep(0.2)
+                await page.keyboard.press("Enter")
+                fixed += 1
+                log_message(messages, f"✓ Combobox customizado preenchido")
+            except Exception:
+                continue
     except Exception:
         pass
 
@@ -858,6 +955,9 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
             if pdf_bytes:
                 await upload_resume(page, pdf_bytes, messages)
 
+            # Expandir secções colapsadas primeiro
+            await expand_collapsed_sections(page, messages)
+
             # Preenchimento por label (mais resiliente)
             await fill_by_possible_labels(page, ["Full name", "Name", "Nome completo"], user_data.get("full_name", ""), messages)
             await fill_by_possible_labels(page, ["Email", "E-mail"], user_data.get("email", ""), messages)
@@ -874,25 +974,33 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
             await fill_field(page, SELECTORS["email"], user_data.get("email", ""), messages)
             await fill_field(page, SELECTORS["phone"], user_data.get("phone", ""), messages)
 
-            # Location por label/autocomplete
-            await fill_by_possible_labels(page, ["Location", "City", "Location (City)"], user_data.get("location") or user_data.get("current_location", ""), messages)
+            # Location com autocomplete inteligente
             loc_val = user_data.get("location") or user_data.get("current_location", "")
-            if not await fill_autocomplete(page, SELECTORS["location"], loc_val, messages):
-                await fill_field(page, SELECTORS["location"], loc_val, messages)
+            if loc_val:
+                # Tenta método específico para autocomplete primeiro
+                if not await fill_autocomplete_location(page, loc_val, messages):
+                    # Fallback para label
+                    if not await fill_by_possible_labels(page, ["Location", "City", "Location (City)"], loc_val, messages):
+                        # Fallback para selector CSS
+                        if not await fill_autocomplete(page, SELECTORS["location"], loc_val, messages):
+                            await fill_field(page, SELECTORS["location"], loc_val, messages)
 
             await fill_field(page, SELECTORS["current_company"], user_data.get("current_company", ""), messages)
             cloc_val = user_data.get("current_location", "")
-            if not await fill_autocomplete(page, SELECTORS["current_location"], cloc_val, messages):
-                await fill_field(page, SELECTORS["current_location"], cloc_val, messages)
+            if cloc_val:
+                if not await fill_autocomplete(page, SELECTORS["current_location"], cloc_val, messages):
+                    await fill_field(page, SELECTORS["current_location"], cloc_val, messages)
 
             await fill_field(page, SELECTORS["salary"], user_data.get("salary_expectations", ""), messages)
             await fill_field(page, SELECTORS["notice"], user_data.get("notice_period", ""), messages)
             await fill_field(page, SELECTORS["additional"], user_data.get("additional_info", ""), messages)
 
+            # Verificar e corrigir campos obrigatórios
             problems = await check_required_errors(page, messages)
             if problems:
                 await asyncio.sleep(0.8)
                 await autofix_required_fields(page, messages)
+                await asyncio.sleep(0.5)
                 problems = await check_required_errors(page, messages)
 
             if plan_only:
@@ -906,7 +1014,7 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     retry_count += 1
                     log_message(messages, f"🔄 Tentativa {retry_count}/{MAX_RETRIES}")
 
-                    # Scroll para forçar render de campos lazy
+                    # Scroll para forçar render de campos lazy e expandir secções
                     try:
                         await page.evaluate("window.scrollTo(0, 0)")
                         await asyncio.sleep(0.3)
@@ -915,9 +1023,26 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     except Exception:
                         pass
 
-                    # Consent/Privacy e reCAPTCHA (best-effort)
+                    # Expandir secções colapsadas (se ainda houver)
+                    await expand_collapsed_sections(page, messages)
+
+                    # Detectar e corrigir campos obrigatórios após scroll
+                    try:
+                        errors = page.locator('[aria-invalid="true"], .field-error, [data-required="true"].error')
+                        error_count = await errors.count()
+                        if error_count > 0:
+                            log_message(messages, f"⚠ Detectados {error_count} campos com erro após scroll")
+                            for idx in range(min(error_count, 5)):
+                                field = errors.nth(idx)
+                                await field.scroll_into_view_if_needed()
+                                await asyncio.sleep(0.2)
+                            # Tentar autofix novamente
+                            await autofix_required_fields(page, messages)
+                    except Exception:
+                        pass
+
+                    # Consent/Privacy (não incluir reCAPTCHA por agora)
                     await try_click_privacy_consent(page, messages)
-                    await try_recaptcha_checkbox(page, messages)
 
                     # Forçar HTML5 validity
                     try:
