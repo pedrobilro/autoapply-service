@@ -16,6 +16,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 
+try:
+    from python_anticaptcha import AnticaptchaClient, NoCaptchaTaskProxylessTask
+    ANTICAPTCHA_AVAILABLE = True
+except ImportError:
+    ANTICAPTCHA_AVAILABLE = False
+    logger.warning("python-anticaptcha não disponível - resolução de CAPTCHA desabilitada")
+
 # --------------------------
 # Logger global
 # --------------------------
@@ -458,6 +465,79 @@ async def try_recaptcha_checkbox(page, messages: List[str]) -> bool:
         await asyncio.sleep(1.5)
         return True
     except Exception:
+        return False
+
+async def solve_recaptcha_v2(page, messages: List[str]) -> bool:
+    """
+    Tenta resolver reCAPTCHA v2 usando serviço anti-captcha.com
+    Requer ANTICAPTCHA_API_KEY como variável de ambiente
+    """
+    if not ANTICAPTCHA_AVAILABLE:
+        log_message(messages, "⚠️ Biblioteca anti-captcha não disponível")
+        return False
+    
+    try:
+        # Verificar se há reCAPTCHA na página
+        site_key = None
+        try:
+            site_key = await page.evaluate("""
+                () => {
+                    const iframe = document.querySelector('iframe[src*="recaptcha"]');
+                    if (!iframe) return null;
+                    const src = iframe.getAttribute('src');
+                    const match = src.match(/[?&]k=([^&]+)/);
+                    return match ? match[1] : null;
+                }
+            """)
+        except Exception as e:
+            log_message(messages, f"Não foi possível encontrar site key do reCAPTCHA: {e}")
+            return False
+        
+        if not site_key:
+            log_message(messages, "Site key do reCAPTCHA não encontrada")
+            return False
+        
+        # Obter API key do anti-captcha
+        anticaptcha_key = os.getenv("ANTICAPTCHA_API_KEY")
+        if not anticaptcha_key:
+            log_message(messages, "⚠️ ANTICAPTCHA_API_KEY não configurada - pulando resolução de CAPTCHA")
+            return False
+        
+        log_message(messages, f"🔓 Resolvendo reCAPTCHA (site key: {site_key[:20]}...)")
+        
+        # Resolver CAPTCHA usando anti-captcha.com
+        client = AnticaptchaClient(anticaptcha_key)
+        task = NoCaptchaTaskProxylessTask(
+            website_url=page.url,
+            website_key=site_key
+        )
+        
+        job = client.createTask(task)
+        job.join()
+        
+        response_token = job.get_solution_response()
+        
+        if response_token:
+            # Injetar token na página
+            await page.evaluate(f"""
+                (token) => {{
+                    const textarea = document.getElementById('g-recaptcha-response');
+                    if (textarea) textarea.innerHTML = token;
+                    if (typeof grecaptcha !== 'undefined') {{
+                        grecaptcha.getResponse = function() {{ return token; }};
+                    }}
+                }}
+            """, response_token)
+            
+            log_message(messages, "✓ reCAPTCHA resolvido com sucesso")
+            await asyncio.sleep(1)
+            return True
+        else:
+            log_message(messages, "✗ Falha ao resolver reCAPTCHA")
+            return False
+            
+    except Exception as e:
+        log_message(messages, f"✗ Erro ao resolver reCAPTCHA: {e}")
         return False
 
 async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str], openai_key: Optional[str] = None, cv_text: Optional[str] = None, user_data: Optional[Dict[str, str]] = None) -> Dict:
@@ -944,9 +1024,48 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            page = await browser.new_page()
+            # Argumentos anti-detecção de bot e CAPTCHA
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-infobars",
+                    "--window-size=1920,1080",
+                    "--start-maximized",
+                    "--disable-gpu"
+                ]
+            )
+            
+            context = await browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            
+            page = await context.new_page()
             page.set_default_timeout(15000)
+            
+            # Remover propriedades que indicam automação
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                
+                window.chrome = {
+                    runtime: {}
+                };
+                
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+            """)
 
             log_message(messages, f"Iniciando candidatura: {job_url}")
             await page.goto(job_url, wait_until="domcontentloaded")
@@ -1043,6 +1162,9 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
 
                     # Consent/Privacy (não incluir reCAPTCHA por agora)
                     await try_click_privacy_consent(page, messages)
+                    
+                    # Tentar resolver reCAPTCHA se presente (requer ANTICAPTCHA_API_KEY)
+                    await solve_recaptcha_v2(page, messages)
 
                     # Forçar HTML5 validity
                     try:
