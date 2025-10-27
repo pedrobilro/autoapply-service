@@ -101,6 +101,8 @@ def extract_from_pdf_bytes(pdf_bytes: bytes) -> Dict[str, str]:
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "\n".join([p.extract_text() or "" for p in pdf.pages])
+        # Guardar texto bruto para usar em prompts da Vision
+        out["__text"] = text
         email = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text)
         phone = re.search(r"(?:\+?\d{2,3}\s?)?(?:\d[\s\-]?){8,14}\d", text)
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -111,7 +113,7 @@ def extract_from_pdf_bytes(pdf_bytes: bytes) -> Dict[str, str]:
                 break
         loc = None
         for ln in lines:
-            if any(k in ln.lower() for k in ["portugal", "lisboa", "lisbon", "porto", "almada", "setúbal"]):
+            if any(k in ln.lower() for k in ["portugal", "lisboa", "lisbon", "porto", "almada", "setúbal", "madrid", "barcelona", "spain", "españa"]):
                 loc = ln
                 break
         if name: out["full_name"] = name
@@ -223,9 +225,9 @@ async def check_required_errors(page, messages: List[str]) -> List[str]:
         log_message(messages, f"⚠ Problemas de validação: {problems}")
     return problems
 
-async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str], openai_key: Optional[str] = None) -> Dict:
+async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str], openai_key: Optional[str] = None, cv_text: Optional[str] = None, user_data: Optional[Dict[str, str]] = None) -> Dict:
     """
-    Envia screenshot para GPT-5 Vision e recebe análise:
+    Envia screenshot + contexto do CV para GPT Vision e recebe análise:
     - success: True/False
     - reason: explicação
     - instructions: lista de ações para corrigir (se não foi sucesso)
@@ -236,6 +238,14 @@ async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str
     
     try:
         log_message(messages, "🔍 Analisando screenshot com GPT-5 Vision...")
+        # Compactar CV text para não estourar tokens
+        cv_excerpt = None
+        if cv_text:
+            trimmed = cv_text.strip()
+            cv_excerpt = trimmed[:4000]  # suficiente
+        known_fields = {k: v for k, v in (user_data or {}).items() if k in [
+            "full_name","email","phone","location","current_company","current_location","salary_expectations","notice_period"
+        ] and v}
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
@@ -246,81 +256,23 @@ async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str
                 },
                 json={
                     "model": "gpt-4o",
-                    "max_tokens": 500,
+                    "temperature": 0.3,
+                    "max_tokens": 800,
                     "messages": [
                         {
                             "role": "system",
-                            "content": """You are an AI that analyzes job application form screenshots to determine success and provide remediation steps.
-
-CRITICAL ANALYSIS STEPS:
-1. SUCCESS INDICATORS - Look for:
-   - "Thank you" / "Application received" / "Successfully submitted" messages
-   - Confirmation pages or success screens
-   - URL changes to /success or /confirmation pages
-   - Submit button disappeared or disabled
-
-2. FAILURE INDICATORS - Look for:
-   - Red error messages or validation errors
-   - Required fields marked with asterisks (*) that are empty
-   - Dropdowns showing "Select..." placeholder
-   - Image CAPTCHAs (select specific images)
-   - Unchecked required checkboxes (e.g., terms & conditions)
-   - Input fields highlighted in red
-   - Text saying "Please fill out this field" or "This field is required"
-
-3. CAPTCHA SOLVING:
-   - For image selection CAPTCHAs (e.g., "Select all images with bananas"):
-     * Analyze ALL images in the grid carefully
-     * Identify which images contain the target object
-     * Provide click instructions with grid positions (row, column) counting from top-left as (1,1)
-     * Example: "click captcha image at position (1,3)" means row 1, column 3
-   - For text/checkbox CAPTCHAs: provide check instructions
-   - For reCAPTCHA/hCaptcha with iframe: mark as UNSOLVABLE_IFRAME
-
-4. PROVIDE DETAILED INSTRUCTIONS:
-   - For empty required fields: specify exact selector and what value to fill
-   - For dropdowns: identify the exact dropdown and what option to select
-   - For checkboxes: specify which checkbox to check
-   - For image CAPTCHAs: provide grid position to click
-
-RESPONSE FORMAT (JSON):
-{
-  "success": true/false,
-  "reason": "Detailed explanation of what you see",
-  "instructions": [
-    "select option 'Portugal' in dropdown 'Which location are you applying for?'",
-    "fill input[name='salary'] with value '50000'",
-    "click captcha image at position (1,3)",
-    "click captcha image at position (2,2)",
-    "click captcha submit button"
-  ],
-  "captcha_type": "image_grid" | "text" | "iframe" | null,
-  "captcha_prompt": "Select all images with bananas" (if applicable)
-}
-
-PLAYWRIGHT INSTRUCTION SYNTAX:
-- fill: "fill input[name='X'] with value 'Y'"
-- select: "select option 'Y' in dropdown[name='X']" OR "select option 'Y' in dropdown 'Label Text'"
-- click: "click button with text 'X'" OR "click element[selector]"
-- check: "check checkbox[name='X']"
-- captcha_click: "click captcha image at position (row,col)"
-- captcha_submit: "click captcha submit button"
-- captcha_unsolvable: "UNSOLVABLE_IFRAME: reCAPTCHA detected"
-"""
+                            "content": """You are an AI that analyzes job application form screenshots and outputs STRICT JSON only. Never use markdown fences. Use the candidate CV text to infer missing values. Prefer label-based actions using accessible names (as visible on the form). If a CAPTCHA iframe is present, set captcha_type to 'iframe'."""
                         },
                         {
                             "role": "user",
                             "content": [
-                                {
-                                    "type": "text",
-                                    "text": "Analyze this job application screenshot. Was it successfully submitted?"
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/png;base64,{screenshot_b64}"
-                                    }
-                                }
+                                {"type": "text", "text": (
+                                    "Analyze this job application screenshot. Decide if submission succeeded. "
+                                    "If not, generate precise Playwright-friendly instructions using label-based selectors. "
+                                    "ALWAYS provide values derived from the CV when a field is empty (e.g., job title, legal name, city, phone, email). "
+                                    "Known fields: " + str(known_fields) + "\n\nCV Text (may be truncated):\n" + (cv_excerpt or "")
+                                )},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}}
                             ]
                         }
                     ]
