@@ -236,23 +236,62 @@ async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str
                     "messages": [
                         {
                             "role": "system",
-                            "content": """You are an AI that analyzes job application screenshots.
-Your task:
-1. Determine if the application was SUCCESSFULLY submitted (look for confirmation messages, thank you pages, success indicators)
-2. If NOT successful, identify what went wrong and provide SPECIFIC playwright actions to fix it
+                            "content": """You are an AI that analyzes job application form screenshots to determine success and provide remediation steps.
 
-Respond in JSON format:
+CRITICAL ANALYSIS STEPS:
+1. SUCCESS INDICATORS - Look for:
+   - "Thank you" / "Application received" / "Successfully submitted" messages
+   - Confirmation pages or success screens
+   - URL changes to /success or /confirmation pages
+   - Submit button disappeared or disabled
+
+2. FAILURE INDICATORS - Look for:
+   - Red error messages or validation errors
+   - Required fields marked with asterisks (*) that are empty
+   - Dropdowns showing "Select..." placeholder
+   - Image CAPTCHAs (select specific images)
+   - Unchecked required checkboxes (e.g., terms & conditions)
+   - Input fields highlighted in red
+   - Text saying "Please fill out this field" or "This field is required"
+
+3. CAPTCHA SOLVING:
+   - For image selection CAPTCHAs (e.g., "Select all images with bananas"):
+     * Analyze ALL images in the grid carefully
+     * Identify which images contain the target object
+     * Provide click instructions with grid positions (row, column) counting from top-left as (1,1)
+     * Example: "click captcha image at position (1,3)" means row 1, column 3
+   - For text/checkbox CAPTCHAs: provide check instructions
+   - For reCAPTCHA/hCaptcha with iframe: mark as UNSOLVABLE_IFRAME
+
+4. PROVIDE DETAILED INSTRUCTIONS:
+   - For empty required fields: specify exact selector and what value to fill
+   - For dropdowns: identify the exact dropdown and what option to select
+   - For checkboxes: specify which checkbox to check
+   - For image CAPTCHAs: provide grid position to click
+
+RESPONSE FORMAT (JSON):
 {
   "success": true/false,
-  "reason": "brief explanation of what you see",
-  "instructions": ["action 1", "action 2", ...] (only if not successful)
+  "reason": "Detailed explanation of what you see",
+  "instructions": [
+    "select option 'Portugal' in dropdown 'Which location are you applying for?'",
+    "fill input[name='salary'] with value '50000'",
+    "click captcha image at position (1,3)",
+    "click captcha image at position (2,2)",
+    "click captcha submit button"
+  ],
+  "captcha_type": "image_grid" | "text" | "iframe" | null,
+  "captcha_prompt": "Select all images with bananas" (if applicable)
 }
 
-Instructions should be specific playwright actions like:
-- "fill input[name='field_name'] with value 'X'"
-- "click button with text 'Continue'"
-- "select option 'value' in dropdown[name='field']"
-- "check checkbox[name='terms']"
+PLAYWRIGHT INSTRUCTION SYNTAX:
+- fill: "fill input[name='X'] with value 'Y'"
+- select: "select option 'Y' in dropdown[name='X']" OR "select option 'Y' in dropdown 'Label Text'"
+- click: "click button with text 'X'" OR "click element[selector]"
+- check: "check checkbox[name='X']"
+- captcha_click: "click captcha image at position (row,col)"
+- captcha_submit: "click captcha submit button"
+- captcha_unsolvable: "UNSOLVABLE_IFRAME: reCAPTCHA detected"
 """
                         },
                         {
@@ -290,8 +329,20 @@ Instructions should be specific playwright actions like:
             else:
                 log_message(messages, f"✗ Vision detectou falha: {result.get('reason', '')}")
                 instructions = result.get("instructions", [])
+                captcha_type = result.get("captcha_type")
+                captcha_prompt = result.get("captcha_prompt")
+                
+                if captcha_type:
+                    log_message(messages, f"🔐 CAPTCHA detectado: {captcha_type}")
+                    if captcha_prompt:
+                        log_message(messages, f"   Prompt: {captcha_prompt}")
+                    if captcha_type != "iframe":
+                        log_message(messages, "   Vision vai tentar resolver...")
+                
                 if instructions:
                     log_message(messages, f"📋 Instruções recebidas: {len(instructions)} ações")
+                    for idx, inst in enumerate(instructions, 1):
+                        log_message(messages, f"   {idx}. {inst}")
             
             return result
             
@@ -308,20 +359,123 @@ async def execute_vision_instructions(page, instructions: List[str], messages: L
         return False
     
     log_message(messages, f"🔧 Executando {len(instructions)} instruções do Vision...")
+    executed_count = 0
     
     for i, instruction in enumerate(instructions, 1):
         try:
-            log_message(messages, f"  [{i}] {instruction}")
+            # Skip unsolvable iframe CAPTCHAs only
+            if "UNSOLVABLE_IFRAME" in instruction:
+                log_message(messages, f"  [{i}] ⚠ CAPTCHA iframe não pode ser resolvido - a pular")
+                continue
+            
+            log_message(messages, f"  [{i}] Executando: {instruction}")
             
             # Parse instruction and execute
             instruction_lower = instruction.lower()
             
-            if "fill" in instruction_lower:
+            # Handle CAPTCHA image clicks by position
+            if "click captcha image at position" in instruction_lower:
+                match = re.search(r"position\s*\((\d+),\s*(\d+)\)", instruction)
+                if match:
+                    row, col = int(match.group(1)), int(match.group(2))
+                    try:
+                        # Find CAPTCHA grid container and click specific image
+                        # Most captchas use grid layout, so we calculate nth-child
+                        # Assuming 3 columns per row (adjust if needed)
+                        cols_per_row = 3
+                        image_index = (row - 1) * cols_per_row + col
+                        
+                        # Try multiple selectors for captcha images
+                        selectors = [
+                            f".captcha-grid img:nth-child({image_index})",
+                            f"[class*='captcha'] img:nth-child({image_index})",
+                            f"img[alt*='captcha']:nth-child({image_index})",
+                            f".rc-imageselect-tile:nth-child({image_index})",
+                        ]
+                        
+                        clicked = False
+                        for selector in selectors:
+                            try:
+                                el = page.locator(selector).first
+                                if await el.count() > 0:
+                                    await el.click(timeout=2000)
+                                    log_message(messages, f"    ✓ Clicou em imagem CAPTCHA ({row},{col})")
+                                    clicked = True
+                                    executed_count += 1
+                                    break
+                            except:
+                                continue
+                        
+                        if not clicked:
+                            # Fallback: get all images and click by index
+                            all_imgs = page.locator("img")
+                            count = await all_imgs.count()
+                            if image_index <= count:
+                                await all_imgs.nth(image_index - 1).click(timeout=2000)
+                                log_message(messages, f"    ✓ Clicou em imagem CAPTCHA ({row},{col}) via fallback")
+                                executed_count += 1
+                    except Exception as e:
+                        log_message(messages, f"    ✗ Falha ao clicar em CAPTCHA image: {e}")
+                continue
+            
+            # Handle CAPTCHA submit button
+            if "click captcha submit" in instruction_lower:
+                try:
+                    selectors = [
+                        "button:has-text('Submit')",
+                        "button:has-text('Verify')",
+                        "[class*='captcha'] button[type='submit']",
+                        ".captcha-submit",
+                        "#captcha-submit"
+                    ]
+                    for selector in selectors:
+                        try:
+                            btn = page.locator(selector).first
+                            if await btn.is_visible(timeout=2000):
+                                await btn.click()
+                                log_message(messages, f"    ✓ Clicou em botão submit do CAPTCHA")
+                                executed_count += 1
+                                break
+                        except:
+                            continue
+                except Exception as e:
+                    log_message(messages, f"    ✗ Falha ao clicar submit CAPTCHA: {e}")
+                continue
+            
+            if "select option" in instruction_lower and "dropdown" in instruction_lower:
+                # Extract option value and dropdown identifier
+                match = re.search(r"select option ['\"](.+?)['\"] in dropdown\s*(?:\[name=['\"](.+?)['\"]\]|['\"](.+?)['\"])", instruction, re.IGNORECASE)
+                if match:
+                    option_value = match.group(1)
+                    dropdown_name = match.group(2) or match.group(3)
+                    
+                    try:
+                        # Try by name attribute first
+                        if match.group(2):
+                            select_el = page.locator(f"select[name='{dropdown_name}']")
+                        else:
+                            # Try by label text
+                            label = page.locator(f"label:has-text('{dropdown_name}')")
+                            select_id = await label.get_attribute("for") if await label.count() > 0 else None
+                            if select_id:
+                                select_el = page.locator(f"select#{select_id}")
+                            else:
+                                # Fallback: any select near the label
+                                select_el = page.locator("select").first
+                        
+                        await select_el.select_option(label=option_value, timeout=3000)
+                        log_message(messages, f"    ✓ Dropdown selecionado: {option_value}")
+                        executed_count += 1
+                    except Exception as e:
+                        log_message(messages, f"    ✗ Falha ao selecionar dropdown: {e}")
+                        
+            elif "fill" in instruction_lower:
                 # Extract selector and value
                 match = re.search(r"fill\s+(.+?)\s+with\s+(?:value\s+)?['\"](.+?)['\"]", instruction, re.IGNORECASE)
                 if match:
                     selector, value = match.groups()
-                    await fill_field(page, selector.strip(), value.strip(), messages)
+                    if await fill_field(page, selector.strip(), value.strip(), messages):
+                        executed_count += 1
                     
             elif "click" in instruction_lower:
                 # Extract what to click
@@ -339,6 +493,7 @@ async def execute_vision_instructions(page, instructions: List[str], messages: L
                             # Try as selector
                             await page.locator(target).first.click(timeout=3000)
                         log_message(messages, f"    ✓ Clicou em: {target[:40]}")
+                        executed_count += 1
                     except Exception as e:
                         log_message(messages, f"    ✗ Falha ao clicar: {e}")
                         
@@ -349,6 +504,7 @@ async def execute_vision_instructions(page, instructions: List[str], messages: L
                     try:
                         await page.locator(selector.strip()).select_option(value.strip())
                         log_message(messages, f"    ✓ Selecionou: {value}")
+                        executed_count += 1
                     except Exception as e:
                         log_message(messages, f"    ✗ Falha ao selecionar: {e}")
                         
@@ -359,6 +515,7 @@ async def execute_vision_instructions(page, instructions: List[str], messages: L
                     try:
                         await page.locator(selector).check(timeout=3000)
                         log_message(messages, f"    ✓ Marcou checkbox: {selector[:40]}")
+                        executed_count += 1
                     except Exception as e:
                         log_message(messages, f"    ✗ Falha ao marcar: {e}")
             
@@ -367,7 +524,8 @@ async def execute_vision_instructions(page, instructions: List[str], messages: L
         except Exception as e:
             log_message(messages, f"    ✗ Erro ao executar instrução: {e}")
     
-    return True
+    log_message(messages, f"✓ Executadas {executed_count}/{len(instructions)} instruções com sucesso")
+    return executed_count > 0
 
 
 async def detect_success(page, job_url: str, messages: List[str]) -> bool:
