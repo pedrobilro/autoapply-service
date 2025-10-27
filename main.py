@@ -740,7 +740,35 @@ def health():
 
 @app.post("/apply")
 async def auto_apply(req: ApplyRequest):
-    result = await apply_to_job_async(req.dict())
-    if result.get("status") == "error":
-        raise HTTPException(status_code=500, detail="critical_error")
-    return result
+    try:
+        logger.info(f"📥 Recebendo request para job: {req.job_url}")
+        logger.info(f"📋 Dados: name={req.full_name}, email={req.email}, phone={req.phone}")
+        
+        result = await apply_to_job_async(req.dict())
+        
+        logger.info(f"✅ Resultado: status={result.get('status')}, ok={result.get('ok')}")
+        
+        if result.get("status") == "error":
+            error_msg = result.get("error", "Erro desconhecido")
+            logger.error(f"❌ Aplicação falhou: {error_msg}")
+            logger.error(f"❌ Log completo: {result.get('log', [])}")
+            raise HTTPException(
+                status_code=500, 
+                detail={
+                    "error": error_msg,
+                    "log": result.get("log", [])
+                }
+            )
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ ERRO CRÍTICO: {type(e).__name__}: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": str(e),
+                "type": type(e).__name__
+            }
+        )
