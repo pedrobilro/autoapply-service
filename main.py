@@ -64,7 +64,9 @@ SELECTORS = {
     "additional": "textarea[name*='additional' i], textarea[name*='cover' i], textarea[name*='message' i], textarea[name*='note' i], textarea[placeholder*='additional' i], textarea[placeholder*='cover' i], textarea[placeholder*='message' i], textarea[placeholder*='note' i]",
     "resume_file": "input[type='file'][name*='resume' i], input[type='file'][name*='cv' i], input[type='file'][name*='curriculum' i], input[type='file'][aria-label*='resume' i], input[type='file'][aria-label*='cv' i], input[type='file'][accept*='pdf']",
     "submit": "button:has-text('Submit'), button:has-text('Apply'), button:has-text('Enviar'), button:has-text('Send'), button[type='submit']",
+    "submit_strict": "button:has-text('Submit application'), button:has-text('Submit Application'), button[data-qa='apply-form-submit']",
     "open_apply": "a:has-text('Apply'), button:has-text('Apply'), a:has-text('Candidatar'), button:has-text('Candidatar')",
+    "gh_form": "[data-qa='application-form'], form[action*='applications'], form",
     "required_any": "input[required], textarea[required], select[required], [aria-required='true']",
 }
 
@@ -224,6 +226,142 @@ async def check_required_errors(page, messages: List[str]) -> List[str]:
     if problems:
         log_message(messages, f"⚠ Problemas de validação: {problems}")
     return problems
+
+async def fill_by_possible_labels(page, labels: List[str], value: str, messages: List[str]) -> bool:
+    if not value:
+        return False
+    for lb in labels:
+        try:
+            el = page.get_by_label(lb)
+            await el.fill(value, timeout=1200)
+            log_message(messages, f"✓ Preenchido por label '{lb}' -> '{value[:40]}'")
+            return True
+        except Exception:
+            continue
+    return False
+
+async def autofix_required_fields(page, messages: List[str]) -> int:
+    fixed = 0
+    # Dropdowns obrigatórios
+    try:
+        selects = page.locator("select[required], select[aria-required='true']")
+        count = await selects.count()
+        for i in range(count):
+            sel = selects.nth(i)
+            try:
+                current = await sel.input_value()
+            except Exception:
+                current = ""
+            if not current:
+                options = await sel.locator("option").all()
+                for opt in options:
+                    label = (await opt.text_content()) or ""
+                    value = (await opt.get_attribute("value")) or ""
+                    if value and value.strip() and "select" not in label.lower():
+                        try:
+                            await sel.select_option(value=value)
+                            fixed += 1
+                            break
+                        except Exception:
+                            continue
+    except Exception:
+        pass
+
+    # Checkboxes obrigatórios (GDPR / privacy / terms)
+    try:
+        checkboxes = page.locator("input[type='checkbox'][required], input[type='checkbox'][aria-required='true']")
+        ccount = await checkboxes.count()
+        for i in range(ccount):
+            cb = checkboxes.nth(i)
+            try:
+                if not await cb.is_checked():
+                    await cb.check()
+                    fixed += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Radios obrigatórios
+    try:
+        radios = page.locator("input[type='radio'][required], input[type='radio'][aria-required='true']")
+        seen = set()
+        rcount = await radios.count()
+        for i in range(rcount):
+            rd = radios.nth(i)
+            name = (await rd.get_attribute("name")) or f"__rd{i}"
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                await rd.check()
+                fixed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Inputs/textarea required vazios
+    try:
+        req_inputs = page.locator("input[required], textarea[required], [aria-required='true']")
+        icount = await req_inputs.count()
+        for i in range(icount):
+            inp = req_inputs.nth(i)
+            try:
+                tag = (await inp.evaluate("el => el.tagName")) or "INPUT"
+            except Exception:
+                tag = "INPUT"
+            try:
+                t = (await inp.get_attribute("type")) or ""
+            except Exception:
+                t = ""
+            if tag == "TEXTAREA" or t in ("text","search","tel","url","number",""):
+                val = ""
+                try:
+                    val = await inp.input_value()
+                except Exception:
+                    pass
+                if not val:
+                    try:
+                        await inp.fill("N/A")
+                        fixed += 1
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    if fixed:
+        log_message(messages, f"✓ autofix_required_fields: corrigiu {fixed} campos obrigatórios")
+    return fixed
+
+async def try_click_privacy_consent(page, messages: List[str]) -> bool:
+    labels = [
+        "I acknowledge", "I agree", "Privacy Policy", "Candidate Privacy",
+        "Política de Privacidade", "GDPR", "Termos"
+    ]
+    ok = False
+    for txt in labels:
+        try:
+            el = page.get_by_label(txt)
+            await el.check(timeout=1000)
+            ok = True
+        except Exception:
+            continue
+    if ok:
+        log_message(messages, "✓ Consent/Privacy marcado")
+    return ok
+
+async def try_recaptcha_checkbox(page, messages: List[str]) -> bool:
+    try:
+        frame = page.frame_locator("iframe[title*='reCAPTCHA'], iframe[src*='recaptcha']")
+        box = frame.locator("span#recaptcha-anchor, div.recaptcha-checkbox-border").first
+        await box.wait_for(state="visible", timeout=2000)
+        await box.click()
+        log_message(messages, "✓ reCAPTCHA checkbox clicado")
+        await asyncio.sleep(1.5)
+        return True
+    except Exception:
+        return False
 
 async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str], openai_key: Optional[str] = None, cv_text: Optional[str] = None, user_data: Optional[Dict[str, str]] = None) -> Dict:
     """
@@ -650,32 +788,35 @@ async def execute_vision_instructions(page, instructions: List[object], messages
 
 
 async def detect_success(page, job_url: str, messages: List[str]) -> bool:
-    ok = False
     try:
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(1200)
         html = (await page.content()).lower()
+
+        # Sinais de erro/pendência prevalecem
+        error_hits = [
+            "please fill out this field", "required", "fix the errors", "invalid"
+        ]
+        if any(h in html for h in error_hits):
+            log_message(messages, "⚠ Mensagens de erro/required ainda presentes")
+            return False
+
+        # Sinais de sucesso explícitos
         if any(h in html for h in SUCCESS_HINTS):
             log_message(messages, "✓ Texto de sucesso detectado")
-            ok = True
+            return True
+
+        # URL mudou? Só conta se nova página tiver confirmação de sucesso
         try:
-            await page.wait_for_url(lambda u: u != job_url, timeout=4000)
-            log_message(messages, "✓ URL alterou após submissão")
-            ok = True
+            await page.wait_for_url(lambda u: u != job_url, timeout=2000)
+            new_html = (await page.content()).lower()
+            if any(h in new_html for h in SUCCESS_HINTS):
+                log_message(messages, "✓ Confirmação de sucesso após redirect")
+                return True
         except PwTimeout:
-            pass
-        try:
-            submit_btn = page.locator(SELECTORS["submit"]).first
-            if await submit_btn.count() == 0:
-                log_message(messages, "✓ Botão Submit desapareceu")
-                ok = True
-            elif await submit_btn.is_disabled():
-                log_message(messages, "✓ Botão Submit desactivado")
-                ok = True
-        except Exception:
             pass
     except Exception as e:
         log_message(messages, f"⚠ Erro ao detectar sucesso: {e}")
-    return ok
+    return False
 
 # --------------------------
 # Core
@@ -717,6 +858,11 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
             if pdf_bytes:
                 await upload_resume(page, pdf_bytes, messages)
 
+            # Preenchimento por label (mais resiliente)
+            await fill_by_possible_labels(page, ["Full name", "Name", "Nome completo"], user_data.get("full_name", ""), messages)
+            await fill_by_possible_labels(page, ["Email", "E-mail"], user_data.get("email", ""), messages)
+            await fill_by_possible_labels(page, ["Phone", "Mobile", "Telefone"], user_data.get("phone", ""), messages)
+
             filled_name = await fill_field(page, SELECTORS["full_name"], user_data.get("full_name", ""), messages)
             if not filled_name and user_data.get("full_name"):
                 parts = user_data["full_name"].split(maxsplit=1)
@@ -728,6 +874,8 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
             await fill_field(page, SELECTORS["email"], user_data.get("email", ""), messages)
             await fill_field(page, SELECTORS["phone"], user_data.get("phone", ""), messages)
 
+            # Location por label/autocomplete
+            await fill_by_possible_labels(page, ["Location", "City", "Location (City)"], user_data.get("location") or user_data.get("current_location", ""), messages)
             loc_val = user_data.get("location") or user_data.get("current_location", "")
             if not await fill_autocomplete(page, SELECTORS["location"], loc_val, messages):
                 await fill_field(page, SELECTORS["location"], loc_val, messages)
@@ -744,6 +892,7 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
             problems = await check_required_errors(page, messages)
             if problems:
                 await asyncio.sleep(0.8)
+                await autofix_required_fields(page, messages)
                 problems = await check_required_errors(page, messages)
 
             if plan_only:
@@ -756,20 +905,58 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                 while retry_count < MAX_RETRIES:
                     retry_count += 1
                     log_message(messages, f"🔄 Tentativa {retry_count}/{MAX_RETRIES}")
-                    
+
+                    # Scroll para forçar render de campos lazy
                     try:
-                        submit_btn = page.locator(SELECTORS["submit"]).first
-                        if allow_submit and await submit_btn.is_enabled():
-                            await submit_btn.click(timeout=5000)
-                            log_message(messages, "✓ Clique em Submit")
-                        elif not allow_submit:
-                            status = "awaiting_consent"
-                            log_message(messages, "⚠ allow_submit=False — não submetido")
-                            break
+                        await page.evaluate("window.scrollTo(0, 0)")
+                        await asyncio.sleep(0.3)
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(0.6)
+                    except Exception:
+                        pass
+
+                    # Consent/Privacy e reCAPTCHA (best-effort)
+                    await try_click_privacy_consent(page, messages)
+                    await try_recaptcha_checkbox(page, messages)
+
+                    # Forçar HTML5 validity
+                    try:
+                        await page.evaluate("""
+                        const f = document.querySelector('form');
+                        if (f) f.reportValidity();
+                        """)
+                    except Exception:
+                        pass
+
+                    # Clique robusto no Submit
+                    try:
+                        import re as _re
+                        submit_btn = page.get_by_role("button", name=_re.compile("submit", _re.I)).first
+                        if await submit_btn.count() == 0:
+                            submit_btn = page.locator(SELECTORS.get("submit_strict", SELECTORS["submit"]))
+                        if await submit_btn.count() == 0:
+                            submit_btn = page.locator(SELECTORS["submit"]).first
+
+                        # Esperar que fique enabled e clicável
+                        handle = await submit_btn.element_handle()
+                        if handle:
+                            await page.wait_for_function(
+                                "(btn)=>!!btn && !btn.disabled && getComputedStyle(btn).pointerEvents!=='none'",
+                                arg=handle,
+                                timeout=4000
+                            )
+                            await submit_btn.scroll_into_view_if_needed()
+                            if allow_submit:
+                                await submit_btn.click(timeout=5000)
+                                log_message(messages, "✓ Clique em Submit (robusto)")
+                            else:
+                                status = "awaiting_consent"
+                                log_message(messages, "⚠ allow_submit=False — não submetido")
+                                break
                         else:
-                            log_message(messages, "✗ Não consegui clicar Submit")
+                            log_message(messages, "✗ Botão Submit não encontrado")
                     except Exception as e:
-                        log_message(messages, f"✗ Erro ao clicar Submit: {e}")
+                        log_message(messages, f"✗ Erro ao clicar Submit (robusto): {e}")
 
                     await asyncio.sleep(2.0)
                     
