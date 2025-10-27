@@ -749,8 +749,8 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
             if plan_only:
                 status = "planned_only"
             else:
-                # Self-healing loop com Vision AI (max 10 tentativas)
-                MAX_RETRIES = 10
+                # Self-healing loop com Vision AI (max 5 tentativas)
+                MAX_RETRIES = 5
                 retry_count = 0
                 
                 while retry_count < MAX_RETRIES:
