@@ -343,9 +343,30 @@ PLAYWRIGHT INSTRUCTION SYNTAX:
             content = data["choices"][0]["message"]["content"]
             log_message(messages, f"📄 Content recebido: {content[:100]}...")
             
+            # Limpar markdown code blocks se existirem
+            content_clean = content.strip()
+            if content_clean.startswith("```json"):
+                content_clean = content_clean[7:]
+            if content_clean.startswith("```"):
+                content_clean = content_clean[3:]
+            if content_clean.endswith("```"):
+                content_clean = content_clean[:-3]
+            content_clean = content_clean.strip()
+            
             # Parse JSON from response
             import json
-            result = json.loads(content)
+            import re
+            try:
+                result = json.loads(content_clean)
+            except json.JSONDecodeError as e:
+                log_message(messages, f"✗ Erro JSON decode: {e}, tentando extrair com regex...")
+                # Fallback: tentar extrair JSON com regex
+                json_match = re.search(r'\{[\s\S]*\}', content_clean)
+                if json_match:
+                    result = json.loads(json_match.group(0))
+                else:
+                    log_message(messages, f"✗ Não foi possível extrair JSON do conteúdo")
+                    return {"success": False, "reason": "Failed to parse Vision response", "instructions": []}
             
             if result.get("success"):
                 log_message(messages, f"✓ Vision confirmou sucesso: {result.get('reason', '')}")
