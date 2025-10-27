@@ -314,11 +314,20 @@ PLAYWRIGHT INSTRUCTION SYNTAX:
             )
             
             if response.status_code != 200:
+                error_text = response.text
                 log_message(messages, f"✗ Vision API error: {response.status_code}")
+                log_message(messages, f"✗ Response: {error_text[:200]}")
                 return {"success": False, "reason": "API error", "instructions": []}
             
             data = response.json()
+            log_message(messages, f"📥 API Response status: OK")
+            
+            if "choices" not in data or not data["choices"]:
+                log_message(messages, f"✗ Response inválida: {str(data)[:200]}")
+                return {"success": False, "reason": "Invalid API response", "instructions": []}
+            
             content = data["choices"][0]["message"]["content"]
+            log_message(messages, f"📄 Content recebido: {content[:100]}...")
             
             # Parse JSON from response
             import json
