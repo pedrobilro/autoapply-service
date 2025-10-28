@@ -467,9 +467,9 @@ async def try_recaptcha_checkbox(page, messages: List[str]) -> bool:
     except Exception:
         return False
 
-async def solve_recaptcha_v2(page, messages: List[str]) -> bool:
+async def solve_captcha(page, messages: List[str]) -> bool:
     """
-    Tenta resolver reCAPTCHA v2 usando serviço 2captcha.com
+    Tenta resolver CAPTCHA (reCAPTCHA v2 ou hCaptcha) usando serviço 2captcha.com
     Requer TWOCAPTCHA_API_KEY como variável de ambiente
     """
     if not TWOCAPTCHA_AVAILABLE:
@@ -477,24 +477,49 @@ async def solve_recaptcha_v2(page, messages: List[str]) -> bool:
         return False
     
     try:
-        # Verificar se há reCAPTCHA na página
+        # Detectar tipo de CAPTCHA
+        captcha_type = None
         site_key = None
+        
+        # Verificar hCaptcha primeiro
         try:
             site_key = await page.evaluate("""
                 () => {
-                    const iframe = document.querySelector('iframe[src*="recaptcha"]');
-                    if (!iframe) return null;
-                    const src = iframe.getAttribute('src');
-                    const match = src.match(/[?&]k=([^&]+)/);
-                    return match ? match[1] : null;
+                    const hcaptchaDiv = document.querySelector('[data-sitekey]');
+                    if (hcaptchaDiv) {
+                        const iframe = document.querySelector('iframe[src*="hcaptcha"]');
+                        if (iframe) return { type: 'hcaptcha', key: hcaptchaDiv.getAttribute('data-sitekey') };
+                    }
+                    return null;
                 }
             """)
-        except Exception as e:
-            log_message(messages, f"Não foi possível encontrar site key do reCAPTCHA: {e}")
-            return False
+            if site_key:
+                captcha_type = "hcaptcha"
+                site_key = site_key.get('key') if isinstance(site_key, dict) else site_key
+                log_message(messages, f"🔍 Detectado hCaptcha (site key: {site_key[:20] if site_key else ''}...)")
+        except:
+            pass
         
-        if not site_key:
-            log_message(messages, "Site key do reCAPTCHA não encontrada")
+        # Verificar reCAPTCHA v2
+        if not captcha_type:
+            try:
+                site_key = await page.evaluate("""
+                    () => {
+                        const iframe = document.querySelector('iframe[src*="recaptcha"]');
+                        if (!iframe) return null;
+                        const src = iframe.getAttribute('src');
+                        const match = src.match(/[?&]k=([^&]+)/);
+                        return match ? match[1] : null;
+                    }
+                """)
+                if site_key:
+                    captcha_type = "recaptcha"
+                    log_message(messages, f"🔍 Detectado reCAPTCHA v2 (site key: {site_key[:20]}...)")
+            except:
+                pass
+        
+        if not captcha_type or not site_key:
+            log_message(messages, "Nenhum CAPTCHA detectado na página")
             return False
         
         # Obter API key do 2captcha
@@ -503,38 +528,68 @@ async def solve_recaptcha_v2(page, messages: List[str]) -> bool:
             log_message(messages, "⚠️ TWOCAPTCHA_API_KEY não configurada - pulando resolução de CAPTCHA")
             return False
         
-        log_message(messages, f"🔓 Resolvendo reCAPTCHA (site key: {site_key[:20]}...)")
+        log_message(messages, f"🔓 Resolvendo {captcha_type.upper()}...")
         
         # Resolver CAPTCHA usando 2captcha.com
         solver = TwoCaptcha(twocaptcha_key)
-        result = solver.recaptcha(
-            sitekey=site_key,
-            url=page.url
-        )
+        
+        if captcha_type == "hcaptcha":
+            result = solver.hcaptcha(
+                sitekey=site_key,
+                url=page.url
+            )
+        else:  # recaptcha
+            result = solver.recaptcha(
+                sitekey=site_key,
+                url=page.url
+            )
         
         response_token = result.get('code')
         
         if response_token:
             # Injetar token na página
-            await page.evaluate(f"""
-                (token) => {{
-                    const textarea = document.getElementById('g-recaptcha-response');
-                    if (textarea) textarea.innerHTML = token;
-                    if (typeof grecaptcha !== 'undefined') {{
-                        grecaptcha.getResponse = function() {{ return token; }};
+            if captcha_type == "hcaptcha":
+                await page.evaluate(f"""
+                    (token) => {{
+                        const textarea = document.querySelector('[name="h-captcha-response"]');
+                        if (textarea) textarea.innerHTML = token;
+                        
+                        // Try to trigger hCaptcha callback
+                        if (window.hcaptcha) {{
+                            try {{
+                                const widgets = document.querySelectorAll('.h-captcha');
+                                widgets.forEach((widget) => {{
+                                    const widgetId = widget.dataset.hcaptchaWidgetId;
+                                    if (widgetId && window.hcaptcha.setResponse) {{
+                                        window.hcaptcha.setResponse(widgetId, token);
+                                    }}
+                                }});
+                            }} catch (e) {{
+                                console.log('Could not trigger hCaptcha callback:', e);
+                            }}
+                        }}
                     }}
-                }}
-            """, response_token)
+                """, response_token)
+            else:  # recaptcha
+                await page.evaluate(f"""
+                    (token) => {{
+                        const textarea = document.getElementById('g-recaptcha-response');
+                        if (textarea) textarea.innerHTML = token;
+                        if (typeof grecaptcha !== 'undefined') {{
+                            grecaptcha.getResponse = function() {{ return token; }};
+                        }}
+                    }}
+                """, response_token)
             
-            log_message(messages, "✓ reCAPTCHA resolvido com sucesso")
-            await asyncio.sleep(1)
+            log_message(messages, f"✓ {captcha_type.upper()} resolvido com sucesso")
+            await asyncio.sleep(2)  # Dar tempo para o site processar
             return True
         else:
-            log_message(messages, "✗ Falha ao resolver reCAPTCHA")
+            log_message(messages, f"✗ Falha ao resolver {captcha_type.upper()}")
             return False
             
     except Exception as e:
-        log_message(messages, f"✗ Erro ao resolver reCAPTCHA: {e}")
+        log_message(messages, f"✗ Erro ao resolver CAPTCHA: {e}")
         return False
 
 async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str], openai_key: Optional[str] = None, cv_text: Optional[str] = None, user_data: Optional[Dict[str, str]] = None) -> Dict:
@@ -1160,8 +1215,8 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     # Consent/Privacy (não incluir reCAPTCHA por agora)
                     await try_click_privacy_consent(page, messages)
                     
-                    # Tentar resolver reCAPTCHA se presente (requer ANTICAPTCHA_API_KEY)
-                    await solve_recaptcha_v2(page, messages)
+                    # Tentar resolver CAPTCHA se presente (reCAPTCHA ou hCaptcha)
+                    await solve_captcha(page, messages)
 
                     # Forçar HTML5 validity
                     try:
