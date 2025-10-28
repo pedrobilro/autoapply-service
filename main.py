@@ -1443,6 +1443,8 @@ async def detect_success(page, job_url: str, messages: List[str]) -> bool:
 # --------------------------
 async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
     messages: List[str] = []
+    app_state = ApplicationState()
+    app_logger = ApplicationLogger()
     t0 = time.time()
     job_url = user_data.get("job_url", "")
     plan_only = bool(user_data.get("plan_only", False))
