@@ -27,11 +27,11 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 try:
-    from python_anticaptcha import AnticaptchaClient, NoCaptchaTaskProxylessTask
-    ANTICAPTCHA_AVAILABLE = True
+    from twocaptcha import TwoCaptcha
+    TWOCAPTCHA_AVAILABLE = True
 except ImportError:
-    ANTICAPTCHA_AVAILABLE = False
-    logger.warning("python-anticaptcha não disponível - resolução de CAPTCHA desabilitada")
+    TWOCAPTCHA_AVAILABLE = False
+    logger.warning("2captcha-python não disponível - resolução de CAPTCHA desabilitada")
 
 # --------------------------
 # FastAPI app & CORS
@@ -469,11 +469,11 @@ async def try_recaptcha_checkbox(page, messages: List[str]) -> bool:
 
 async def solve_recaptcha_v2(page, messages: List[str]) -> bool:
     """
-    Tenta resolver reCAPTCHA v2 usando serviço anti-captcha.com
-    Requer ANTICAPTCHA_API_KEY como variável de ambiente
+    Tenta resolver reCAPTCHA v2 usando serviço 2captcha.com
+    Requer TWOCAPTCHA_API_KEY como variável de ambiente
     """
-    if not ANTICAPTCHA_AVAILABLE:
-        log_message(messages, "⚠️ Biblioteca anti-captcha não disponível")
+    if not TWOCAPTCHA_AVAILABLE:
+        log_message(messages, "⚠️ Biblioteca 2captcha-python não disponível")
         return False
     
     try:
@@ -497,25 +497,22 @@ async def solve_recaptcha_v2(page, messages: List[str]) -> bool:
             log_message(messages, "Site key do reCAPTCHA não encontrada")
             return False
         
-        # Obter API key do anti-captcha
-        anticaptcha_key = os.getenv("ANTICAPTCHA_API_KEY")
-        if not anticaptcha_key:
-            log_message(messages, "⚠️ ANTICAPTCHA_API_KEY não configurada - pulando resolução de CAPTCHA")
+        # Obter API key do 2captcha
+        twocaptcha_key = os.getenv("TWOCAPTCHA_API_KEY")
+        if not twocaptcha_key:
+            log_message(messages, "⚠️ TWOCAPTCHA_API_KEY não configurada - pulando resolução de CAPTCHA")
             return False
         
         log_message(messages, f"🔓 Resolvendo reCAPTCHA (site key: {site_key[:20]}...)")
         
-        # Resolver CAPTCHA usando anti-captcha.com
-        client = AnticaptchaClient(anticaptcha_key)
-        task = NoCaptchaTaskProxylessTask(
-            website_url=page.url,
-            website_key=site_key
+        # Resolver CAPTCHA usando 2captcha.com
+        solver = TwoCaptcha(twocaptcha_key)
+        result = solver.recaptcha(
+            sitekey=site_key,
+            url=page.url
         )
         
-        job = client.createTask(task)
-        job.join()
-        
-        response_token = job.get_solution_response()
+        response_token = result.get('code')
         
         if response_token:
             # Injetar token na página
