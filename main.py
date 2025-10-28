@@ -1519,6 +1519,13 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
     plan_only = bool(user_data.get("plan_only", False))
     allow_submit = bool(user_data.get("allow_submit", True))
     openai_api_key = user_data.get("openai_api_key")
+    
+    # Inicializar variáveis de screenshot e estado
+    screenshot_b64 = ""
+    pre_submit_b64 = ""
+    post_submit_b64 = ""
+    ok = False
+    status = "unknown"
 
     pdf_bytes = await load_resume_bytes(user_data.get("resume_url"), user_data.get("resume_b64"))
     if pdf_bytes:
@@ -1531,10 +1538,6 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
     missing = [f for f in required if not user_data.get(f)]
     if missing:
         return {"ok": False, "status": "missing_fields", "missing": missing, "log": messages}
-
-    screenshot_b64 = None
-    ok = False
-    status = "unknown"
 
     try:
         async with async_playwright() as p:
@@ -1781,6 +1784,16 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                                 timeout=4000
                             )
                             await submit_btn.scroll_into_view_if_needed()
+                            
+                            # 📸 Screenshot PRE-SUBMIT
+                            pre_submit_b64 = ""
+                            try:
+                                pre_png = await page.screenshot(full_page=True)
+                                pre_submit_b64 = base64.b64encode(pre_png).decode("utf-8")
+                                log_message(messages, "✓ Screenshot pré-submit capturado")
+                            except Exception as e:
+                                log_message(messages, f"⚠ Não foi possível capturar pré-submit: {e}")
+                            
                             if allow_submit:
                                 # 🎭 Clique humano no submit
                                 timing = HumanTiming()
@@ -1807,13 +1820,15 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     await asyncio.sleep(2.0)
                     app_state.current_step = "submitted"
                     
-                    # Tirar screenshot para análise
+                    # 📸 Screenshot POST-SUBMIT
+                    post_submit_b64 = ""
                     try:
-                        png = await page.screenshot(full_page=True)
-                        screenshot_b64 = base64.b64encode(png).decode("utf-8")
-                        log_message(messages, "✓ Screenshot capturado")
+                        post_png = await page.screenshot(full_page=True)
+                        post_submit_b64 = base64.b64encode(post_png).decode("utf-8")
+                        screenshot_b64 = post_submit_b64  # manter compatibilidade
+                        log_message(messages, "✓ Screenshot pós-submit capturado")
                     except Exception as e:
-                        log_message(messages, f"✗ Erro ao capturar screenshot: {e}")
+                        log_message(messages, f"✗ Erro ao capturar screenshot pós-submit: {e}")
                         break
                     
                     # Detectar sucesso com heurísticas básicas
@@ -1871,13 +1886,25 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
     app_logger.log_performance("total_execution", total_time)
     
     elapsed = round(time.time() - t0, 2)
+    
+    # Garantir que temos as variáveis de screenshot
+    if 'pre_submit_b64' not in locals():
+        pre_submit_b64 = ""
+    if 'post_submit_b64' not in locals():
+        post_submit_b64 = screenshot_b64 if screenshot_b64 else ""
+    
     return {
         "ok": ok,
         "status": status,
         "job_url": job_url,
         "elapsed_s": elapsed,
+        "platform": app_state.platform_detected or None,
         "log": messages,
-        "screenshot": screenshot_b64,
+        "screenshot": (post_submit_b64 or screenshot_b64 or ""),  # compat
+        "evidence": {
+            "pre_submit_screenshot_b64": pre_submit_b64 or "",
+            "post_submit_screenshot_b64": post_submit_b64 or screenshot_b64 or ""
+        },
         "state": app_state.to_dict(),
         "metrics": app_logger.performance_metrics,
         "errors": app_logger.error_stats
@@ -1894,6 +1921,10 @@ def root():
 def health():
     return {"status": "healthy", "service": "auto-apply-playwright", "version": "2.0"}
 
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
 @app.post("/apply")
 async def auto_apply(req: ApplyRequest):
     try:
@@ -1904,19 +1935,22 @@ async def auto_apply(req: ApplyRequest):
         
         logger.info(f"✅ Resultado: status={result.get('status')}, ok={result.get('ok')}")
         
-        if result.get("status") == "error":
-            error_msg = result.get("error", "Erro desconhecido")
-            logger.error(f"❌ Aplicação falhou: {error_msg}")
-            logger.error(f"❌ Log completo: {result.get('log', [])}")
-            raise HTTPException(
-                status_code=500, 
-                detail={
-                    "error": error_msg,
-                    "log": result.get("log", [])
-                }
-            )
+        # Normalizar resposta no formato esperado
+        payload = {
+            "ok": bool(result.get("ok")),
+            "status": result.get("status", "unknown"),
+            "platform": result.get("platform") or (result.get("state", {}) or {}).get("platform_detected"),
+            "evidence": result.get("evidence", {}),
+            "log": result.get("log", []),
+            "error": None
+        }
         
-        return result
+        # Se falhou, incluir erro
+        if not payload["ok"] or payload["status"] in ("error", "failed"):
+            error_details = (result.get("errors") or {})
+            payload["error"] = error_details.get("fatal") or result.get("error") or "Auto-apply failed"
+        
+        return payload
     except HTTPException:
         raise
     except Exception as e:
