@@ -1438,6 +1438,75 @@ async def detect_success(page, job_url: str, messages: List[str]) -> bool:
         log_message(messages, f"⚠ Erro ao detectar sucesso: {e}")
     return False
 
+async def detect_application_platform(page, messages: List[str]) -> Dict:
+    """Detecta automaticamente a plataforma de candidatura"""
+    try:
+        url = page.url.lower()
+        html = await page.content()
+        html_lower = html.lower()
+        
+        # Detectar por URL
+        if "greenhouse.io" in url or "greenhouse" in html_lower:
+            log_message(messages, "🎯 Plataforma detectada: GREENHOUSE")
+            return {
+                "platform": "greenhouse",
+                "confidence": "high",
+                "selectors": {
+                    "first_name": "input[name='first_name']",
+                    "last_name": "input[name='last_name']",
+                    "email": "input[name='email']",
+                    "phone": "input[name='phone']"
+                }
+            }
+        
+        if "lever.co" in url or "lever" in html_lower:
+            log_message(messages, "🎯 Plataforma detectada: LEVER")
+            return {
+                "platform": "lever",
+                "confidence": "high",
+                "selectors": {
+                    "name": "input[name='name']",
+                    "email": "input[name='email']",
+                    "phone": "input[name='phone']"
+                }
+            }
+        
+        if "workday.com" in url or "workday" in html_lower:
+            log_message(messages, "🎯 Plataforma detectada: WORKDAY")
+            return {
+                "platform": "workday",
+                "confidence": "high",
+                "selectors": {}
+            }
+        
+        if "ashbyhq.com" in url or "ashby" in html_lower:
+            log_message(messages, "🎯 Plataforma detectada: ASHBY")
+            return {
+                "platform": "ashby",
+                "confidence": "high",
+                "selectors": SELECTORS
+            }
+        
+        # Genérica por padrões HTML
+        if "[data-qa='application-form']" in html or "application_form" in html:
+            log_message(messages, "🎯 Plataforma detectada: GREENHOUSE (por HTML)")
+            return {"platform": "greenhouse", "confidence": "medium", "selectors": SELECTORS}
+        
+        log_message(messages, "⚠️ Plataforma não identificada - usando abordagem genérica")
+        return {
+            "platform": "generic",
+            "confidence": "low",
+            "selectors": SELECTORS
+        }
+        
+    except Exception as e:
+        log_message(messages, f"⚠️ Erro ao detectar plataforma: {e}")
+        return {
+            "platform": "unknown",
+            "confidence": "none",
+            "selectors": SELECTORS
+        }
+
 # --------------------------
 # Core
 # --------------------------
