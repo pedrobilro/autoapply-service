@@ -472,11 +472,18 @@ async def solve_captcha(page, messages: List[str]) -> bool:
     Tenta resolver CAPTCHA (reCAPTCHA v2 ou hCaptcha) usando serviço 2captcha.com
     Requer TWOCAPTCHA_API_KEY como variável de ambiente
     """
-    log_message(messages, "🔎 Verificando presença de CAPTCHA...")
+    # Log IMEDIATAMENTE ao entrar na função
+    log_message(messages, "=" * 50)
+    log_message(messages, "🔎 [SOLVE_CAPTCHA] INICIANDO verificação de CAPTCHA...")
+    log_message(messages, "=" * 50)
     
+    # Verificar se biblioteca está disponível
     if not TWOCAPTCHA_AVAILABLE:
-        log_message(messages, "⚠️ Biblioteca 2captcha-python não disponível")
+        log_message(messages, "⚠️ [ERRO] Biblioteca 2captcha-python NÃO DISPONÍVEL")
+        log_message(messages, "   Instale com: pip install 2captcha-python")
         return False
+    
+    log_message(messages, "✓ Biblioteca 2captcha-python disponível")
     
     try:
         # Detectar tipo de CAPTCHA
@@ -484,7 +491,7 @@ async def solve_captcha(page, messages: List[str]) -> bool:
         site_key = None
         
         # Verificar hCaptcha primeiro
-        log_message(messages, "   Verificando hCaptcha...")
+        log_message(messages, "🔍 [STEP 1/5] Procurando hCaptcha...")
         try:
             site_key = await page.evaluate("""
                 () => {
@@ -509,13 +516,14 @@ async def solve_captcha(page, messages: List[str]) -> bool:
             if site_key:
                 captcha_type = "hcaptcha"
                 site_key = site_key.get('key') if isinstance(site_key, dict) else site_key
-                log_message(messages, f"🔍 ✓ Detectado hCaptcha (site key: {site_key[:20] if site_key else ''}...)")
+                log_message(messages, f"✅ hCaptcha DETECTADO!")
+                log_message(messages, f"   Site Key: {site_key[:30]}...")
         except Exception as e:
-            log_message(messages, f"   hCaptcha check error: {str(e)[:50]}")
+            log_message(messages, f"⚠️ Erro ao verificar hCaptcha: {str(e)[:80]}")
         
         # Verificar reCAPTCHA v2
         if not captcha_type:
-            log_message(messages, "   Verificando reCAPTCHA...")
+            log_message(messages, "🔍 [STEP 2/5] Procurando reCAPTCHA v2...")
             try:
                 site_key = await page.evaluate("""
                     () => {
@@ -528,84 +536,137 @@ async def solve_captcha(page, messages: List[str]) -> bool:
                 """)
                 if site_key:
                     captcha_type = "recaptcha"
-                    log_message(messages, f"🔍 ✓ Detectado reCAPTCHA v2 (site key: {site_key[:20]}...)")
+                    log_message(messages, f"✅ reCAPTCHA v2 DETECTADO!")
+                    log_message(messages, f"   Site Key: {site_key[:30]}...")
             except Exception as e:
-                log_message(messages, f"   reCAPTCHA check error: {str(e)[:50]}")
+                log_message(messages, f"⚠️ Erro ao verificar reCAPTCHA: {str(e)[:80]}")
         
         if not captcha_type or not site_key:
-            log_message(messages, "✓ Nenhum CAPTCHA detectado na página")
+            log_message(messages, "✓ [RESULTADO] Nenhum CAPTCHA detectado - continuando normalmente")
             return False
+        
+        log_message(messages, f"🎯 [STEP 3/5] CAPTCHA CONFIRMADO: {captcha_type.upper()}")
         
         # Obter API key do 2captcha
         twocaptcha_key = os.getenv("TWOCAPTCHA_API_KEY")
         if not twocaptcha_key:
-            log_message(messages, "⚠️ TWOCAPTCHA_API_KEY não configurada - pulando resolução de CAPTCHA")
+            log_message(messages, "❌ [ERRO CRÍTICO] TWOCAPTCHA_API_KEY NÃO ESTÁ CONFIGURADA!")
+            log_message(messages, "   Configure a variável de ambiente no Railway:")
+            log_message(messages, "   TWOCAPTCHA_API_KEY=your_api_key_here")
             return False
         
-        log_message(messages, f"🔓 Resolvendo {captcha_type.upper()}...")
+        log_message(messages, f"✓ API Key encontrada: {twocaptcha_key[:10]}...")
+        log_message(messages, f"🚀 [STEP 4/5] Enviando {captcha_type.upper()} para 2captcha.com...")
         
         # Resolver CAPTCHA usando 2captcha.com
         solver = TwoCaptcha(twocaptcha_key)
         
-        if captcha_type == "hcaptcha":
-            result = solver.hcaptcha(
-                sitekey=site_key,
-                url=page.url
-            )
-        else:  # recaptcha
-            result = solver.recaptcha(
-                sitekey=site_key,
-                url=page.url
-            )
+        try:
+            if captcha_type == "hcaptcha":
+                log_message(messages, f"   Chamando solver.hcaptcha(sitekey={site_key[:20]}..., url={page.url[:50]}...)")
+                result = solver.hcaptcha(
+                    sitekey=site_key,
+                    url=page.url
+                )
+            else:  # recaptcha
+                log_message(messages, f"   Chamando solver.recaptcha(sitekey={site_key[:20]}..., url={page.url[:50]}...)")
+                result = solver.recaptcha(
+                    sitekey=site_key,
+                    url=page.url
+                )
+            
+            log_message(messages, f"✓ Resposta recebida do 2captcha: {str(result)[:100]}...")
+        except Exception as solver_error:
+            log_message(messages, f"❌ [ERRO] Falha ao chamar API 2captcha: {type(solver_error).__name__}")
+            log_message(messages, f"   Mensagem: {str(solver_error)[:150]}")
+            import traceback
+            log_message(messages, f"   Traceback: {traceback.format_exc()[:300]}")
+            return False
         
         response_token = result.get('code')
         
         if response_token:
+            log_message(messages, f"✅ Token recebido: {response_token[:40]}...")
+            log_message(messages, f"🔧 [STEP 5/5] Injetando token na página...")
+            
             # Injetar token na página
-            if captcha_type == "hcaptcha":
-                await page.evaluate(f"""
-                    (token) => {{
-                        const textarea = document.querySelector('[name="h-captcha-response"]');
-                        if (textarea) textarea.innerHTML = token;
-                        
-                        // Try to trigger hCaptcha callback
-                        if (window.hcaptcha) {{
-                            try {{
-                                const widgets = document.querySelectorAll('.h-captcha');
-                                widgets.forEach((widget) => {{
-                                    const widgetId = widget.dataset.hcaptchaWidgetId;
-                                    if (widgetId && window.hcaptcha.setResponse) {{
-                                        window.hcaptcha.setResponse(widgetId, token);
-                                    }}
-                                }});
-                            }} catch (e) {{
-                                console.log('Could not trigger hCaptcha callback:', e);
+            try:
+                if captcha_type == "hcaptcha":
+                    await page.evaluate(f"""
+                        (token) => {{
+                            console.log('[CAPTCHA] Injetando hCaptcha token...');
+                            const textarea = document.querySelector('[name="h-captcha-response"]');
+                            if (textarea) {{
+                                textarea.innerHTML = token;
+                                console.log('[CAPTCHA] Textarea preenchida');
+                            }} else {{
+                                console.log('[CAPTCHA] AVISO: textarea h-captcha-response não encontrada');
+                            }}
+                            
+                            // Try to trigger hCaptcha callback
+                            if (window.hcaptcha) {{
+                                try {{
+                                    const widgets = document.querySelectorAll('.h-captcha');
+                                    console.log('[CAPTCHA] Encontrados', widgets.length, 'widgets hCaptcha');
+                                    widgets.forEach((widget, i) => {{
+                                        const widgetId = widget.dataset.hcaptchaWidgetId;
+                                        console.log('[CAPTCHA] Widget', i, 'ID:', widgetId);
+                                        if (widgetId && window.hcaptcha.setResponse) {{
+                                            window.hcaptcha.setResponse(widgetId, token);
+                                            console.log('[CAPTCHA] setResponse chamado para widget', widgetId);
+                                        }}
+                                    }});
+                                }} catch (e) {{
+                                    console.log('[CAPTCHA] Erro ao trigger callback:', e);
+                                }}
+                            }} else {{
+                                console.log('[CAPTCHA] AVISO: window.hcaptcha não disponível');
                             }}
                         }}
-                    }}
-                """, response_token)
-            else:  # recaptcha
-                await page.evaluate(f"""
-                    (token) => {{
-                        const textarea = document.getElementById('g-recaptcha-response');
-                        if (textarea) textarea.innerHTML = token;
-                        if (typeof grecaptcha !== 'undefined') {{
-                            grecaptcha.getResponse = function() {{ return token; }};
+                    """, response_token)
+                    log_message(messages, "✓ Token hCaptcha injetado (verifique console do browser)")
+                else:  # recaptcha
+                    await page.evaluate(f"""
+                        (token) => {{
+                            console.log('[CAPTCHA] Injetando reCAPTCHA token...');
+                            const textarea = document.getElementById('g-recaptcha-response');
+                            if (textarea) {{
+                                textarea.innerHTML = token;
+                                console.log('[CAPTCHA] Textarea g-recaptcha-response preenchida');
+                            }} else {{
+                                console.log('[CAPTCHA] AVISO: textarea g-recaptcha-response não encontrada');
+                            }}
+                            if (typeof grecaptcha !== 'undefined') {{
+                                grecaptcha.getResponse = function() {{ return token; }};
+                                console.log('[CAPTCHA] grecaptcha.getResponse sobrescrito');
+                            }} else {{
+                                console.log('[CAPTCHA] AVISO: grecaptcha não disponível');
+                            }}
                         }}
-                    }}
-                """, response_token)
+                    """, response_token)
+                    log_message(messages, "✓ Token reCAPTCHA injetado (verifique console do browser)")
+            except Exception as inject_error:
+                log_message(messages, f"❌ [ERRO] Falha ao injetar token: {str(inject_error)[:150]}")
+                return False
             
-            log_message(messages, f"✓ {captcha_type.upper()} resolvido com sucesso")
-            await asyncio.sleep(2)  # Dar tempo para o site processar
+            log_message(messages, f"🎉 {captcha_type.upper()} RESOLVIDO COM SUCESSO!")
+            log_message(messages, "   Aguardando 3s para processamento...")
+            await asyncio.sleep(3)  # Dar mais tempo para o site processar
             return True
         else:
-            log_message(messages, f"✗ Falha ao resolver {captcha_type.upper()} - sem token")
+            log_message(messages, f"❌ [ERRO] 2captcha retornou resposta SEM TOKEN")
+            log_message(messages, f"   Resposta completa: {str(result)[:200]}")
             return False
             
     except Exception as e:
-        log_message(messages, f"✗ Erro CRÍTICO ao resolver CAPTCHA: {type(e).__name__}: {str(e)[:100]}")
+        log_message(messages, f"❌ ❌ ❌ [EXCEÇÃO CRÍTICA] ❌ ❌ ❌")
+        log_message(messages, f"Tipo: {type(e).__name__}")
+        log_message(messages, f"Mensagem: {str(e)[:200]}")
         import traceback
-        log_message(messages, f"   Traceback: {traceback.format_exc()[:200]}")
+        tb = traceback.format_exc()
+        log_message(messages, f"Traceback completo:")
+        for line in tb.split('\n')[:15]:  # Primeiras 15 linhas
+            log_message(messages, f"  {line}")
         return False
 
 async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str], openai_key: Optional[str] = None, cv_text: Optional[str] = None, user_data: Optional[Dict[str, str]] = None) -> Dict:
