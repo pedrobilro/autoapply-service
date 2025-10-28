@@ -1,13 +1,23 @@
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+# Usa a imagem oficial do Playwright com browsers já instalados
+FROM mcr.microsoft.com/playwright/python:v1.46.0
 
 WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
 
-COPY requirements.txt /app/
+# Dependências Python
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py /app/main.py
-EXPOSE 8080
+# Copia o código
+COPY . /app
 
-CMD ["bash", "-lc", "python -m playwright install --with-deps chromium && uvicorn main:app --host 0.0.0.0 --port 8080"]
+# Ambiente
+ENV PYTHONUNBUFFERED=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PORT=8080
+
+# Healthcheck simples (Railway)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:${PORT}/healthz || exit 1
+
+# Arranque FastAPI
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
