@@ -323,6 +323,34 @@ async def expand_collapsed_sections(page, messages: List[str]):
         log_message(messages, f"✓ Expandidas {expanded} secções colapsadas")
     return expanded
 
+async def navigate_next_steps(page, messages: List[str], max_steps: int = 3) -> int:
+    """Avança em formulários multi-etapas (Greenhouse, etc.) clicando em Next/Continue."""
+    texts = [
+        "Next", "Continue", "Save and continue", "Continue to application", "Proceed",
+        "Próximo", "Seguinte", "Continuar"
+    ]
+    clicked = 0
+    for _ in range(max_steps):
+        found = False
+        for t in texts:
+            try:
+                btn = page.get_by_role("button", name=re.compile(t, re.I)).first
+                if await btn.is_visible(timeout=1500):
+                    await btn.scroll_into_view_if_needed()
+                    await btn.click(timeout=2000)
+                    clicked += 1
+                    log_message(messages, f"→ Clique '{t}'")
+                    await asyncio.sleep(1.0)
+                    found = True
+                    break
+            except Exception:
+                continue
+        if not found:
+            break
+    if clicked:
+        log_message(messages, f"✓ Avançou {clicked} passo(s)")
+    return clicked
+
 async def autofix_required_fields(page, messages: List[str]) -> int:
     fixed = 0
     # Dropdowns obrigatórios (HTML select)
@@ -1233,15 +1261,28 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                         if not await fill_autocomplete(page, SELECTORS["location"], loc_val, messages):
                             await fill_field(page, SELECTORS["location"], loc_val, messages)
 
-            await fill_field(page, SELECTORS["current_company"], user_data.get("current_company", ""), messages)
+            # Empresa atual (tentar por label primeiro)
+            if not await fill_by_possible_labels(page, ["Current company", "Company", "Empresa atual"], user_data.get("current_company", ""), messages):
+                await fill_field(page, SELECTORS["current_company"], user_data.get("current_company", ""), messages)
+
+            # Localização atual (autocomplete/label)
             cloc_val = user_data.get("current_location", "")
             if cloc_val:
-                if not await fill_autocomplete(page, SELECTORS["current_location"], cloc_val, messages):
-                    await fill_field(page, SELECTORS["current_location"], cloc_val, messages)
+                if not await fill_by_possible_labels(page, ["Current location", "City", "Cidade"], cloc_val, messages):
+                    if not await fill_autocomplete(page, SELECTORS["current_location"], cloc_val, messages):
+                        await fill_field(page, SELECTORS["current_location"], cloc_val, messages)
 
-            await fill_field(page, SELECTORS["salary"], user_data.get("salary_expectations", ""), messages)
-            await fill_field(page, SELECTORS["notice"], user_data.get("notice_period", ""), messages)
-            await fill_field(page, SELECTORS["additional"], user_data.get("additional_info", ""), messages)
+            # Expectativas salariais
+            if not await fill_by_possible_labels(page, ["Salary", "Salary expectations", "Compensation", "Desired salary"], user_data.get("salary_expectations", ""), messages):
+                await fill_field(page, SELECTORS["salary"], user_data.get("salary_expectations", ""), messages)
+
+            # Período de aviso / disponibilidade
+            if not await fill_by_possible_labels(page, ["Notice period", "Availability", "Earliest start date", "Disponibilidade"], user_data.get("notice_period", ""), messages):
+                await fill_field(page, SELECTORS["notice"], user_data.get("notice_period", ""), messages)
+
+            # Informação adicional / carta de apresentação
+            if not await fill_by_possible_labels(page, ["Additional information", "Cover letter", "Notes", "Message", "Informação adicional"], user_data.get("additional_info", ""), messages):
+                await fill_field(page, SELECTORS["additional"], user_data.get("additional_info", ""), messages)
 
             # Verificar e corrigir campos obrigatórios
             problems = await check_required_errors(page, messages)
@@ -1301,6 +1342,12 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                         const f = document.querySelector('form');
                         if (f) f.reportValidity();
                         """)
+                    except Exception:
+                        pass
+
+                    # Em formulários multi-etapas, avançar antes de procurar Submit
+                    try:
+                        await navigate_next_steps(page, messages, max_steps=3)
                     except Exception:
                         pass
 
