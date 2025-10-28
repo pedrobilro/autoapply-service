@@ -26,6 +26,55 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+# --------------------------
+# Classes de Gestão
+# --------------------------
+class SmartRetrySystem:
+    def __init__(self):
+        self.retry_patterns = {
+            "captcha": {"max_attempts": 3, "delay": 5},
+            "network": {"max_attempts": 5, "delay": 2},
+            "form_not_found": {"max_attempts": 2, "delay": 3},
+            "submit": {"max_attempts": 3, "delay": 4}
+        }
+    async def should_retry(self, error_type: str, attempt: int, messages: List[str]) -> bool:
+        pattern = self.retry_patterns.get(error_type, {"max_attempts": 2, "delay": 2})
+        if attempt >= pattern["max_attempts"]:
+            log_message(messages, f"❌ Máximo de tentativas ({pattern['max_attempts']}) atingido para {error_type}")
+            return False
+        delay = pattern["delay"]
+        log_message(messages, f"🔄 Tentativa {attempt + 1}/{pattern['max_attempts']} em {delay}s...")
+        await asyncio.sleep(delay)
+        return True
+
+class ApplicationState:
+    def __init__(self):
+        self.current_step = "initial"
+        self.filled_fields = set()
+        self.encountered_issues = []
+        self.captcha_solved = False
+        self.platform_detected = "unknown"
+    def to_dict(self):
+        return {
+            "current_step": self.current_step,
+            "filled_fields": list(self.filled_fields),
+            "encountered_issues": self.encountered_issues,
+            "captcha_solved": self.captcha_solved,
+            "platform_detected": self.platform_detected
+        }
+
+class ApplicationLogger:
+    def __init__(self):
+        self.performance_metrics = {}
+        self.error_stats = {}
+        self.start_time = time.time()
+    def log_performance(self, step: str, duration: float):
+        self.performance_metrics[step] = duration
+    def log_error(self, error_type: str, details: str):
+        if error_type not in self.error_stats:
+            self.error_stats[error_type] = 0
+        self.error_stats[error_type] += 1
+
 try:
     from twocaptcha import TwoCaptcha
     TWOCAPTCHA_AVAILABLE = True
@@ -150,9 +199,139 @@ async def load_resume_bytes(resume_url: Optional[str], resume_b64: Optional[str]
     return None
 
 # --------------------------
+# Comportamentos Humanos
+# --------------------------
+async def human_mouse_movement(page, messages: List[str]):
+    """Move o mouse de forma humana entre elementos"""
+    try:
+        viewport = page.viewport_size
+        if not viewport:
+            return
+        points = []
+        for _ in range(4):
+            x = random.randint(100, viewport['width'] - 100)
+            y = random.randint(100, viewport['height'] - 100)
+            points.append((x, y))
+        for i in range(len(points) - 1):
+            start_x, start_y = points[i]
+            end_x, end_y = points[i + 1]
+            control_x = (start_x + end_x) // 2 + random.randint(-50, 50)
+            control_y = (start_y + end_y) // 2 + random.randint(-50, 50)
+            steps = random.randint(8, 15)
+            for step in range(steps):
+                t = step / steps
+                x = (1-t)**2 * start_x + 2*(1-t)*t * control_x + t**2 * end_x
+                y = (1-t)**2 * start_y + 2*(1-t)*t * control_y + t**2 * end_y
+                await page.mouse.move(int(x), int(y))
+                await asyncio.sleep(random.uniform(0.01, 0.03))
+    except Exception:
+        pass
+
+async def human_click(page, selector: str, messages: List[str]) -> bool:
+    """Clica num elemento de forma humana"""
+    try:
+        element = page.locator(selector).first
+        await element.wait_for(state="visible", timeout=5000)
+        bbox = await element.bounding_box()
+        if bbox:
+            target_x = bbox['x'] + bbox['width'] * random.uniform(0.3, 0.7)
+            target_y = bbox['y'] + bbox['height'] * random.uniform(0.3, 0.7)
+            await page.mouse.move(
+                target_x + random.randint(-5, 5),
+                target_y + random.randint(-5, 5)
+            )
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+            click_duration = random.uniform(50, 150)
+            await page.mouse.click(target_x, target_y, delay=click_duration)
+            return True
+    except Exception:
+        pass
+    return False
+
+async def human_type(page, selector: str, text: str, messages: List[str]) -> bool:
+    """Digita texto como um humano (com erros e correções)"""
+    try:
+        element = page.locator(selector).first
+        await element.click()
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+        if random.random() < 0.3:
+            await element.press("Control+A")
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+            await element.press("Backspace")
+            await asyncio.sleep(random.uniform(0.2, 0.4))
+        for i, char in enumerate(text):
+            typing_speed = random.uniform(0.08, 0.25)
+            if random.random() < 0.02:
+                wrong_char = random.choice('abcdefghijklmnopqrstuvwxyz')
+                await element.type(wrong_char, delay=typing_speed * 1000)
+                await asyncio.sleep(random.uniform(0.1, 0.3))
+                await element.press("Backspace")
+                await asyncio.sleep(random.uniform(0.1, 0.2))
+            await element.type(char, delay=typing_speed * 1000)
+            if random.random() < 0.05:
+                await asyncio.sleep(random.uniform(0.5, 1.2))
+        return True
+    except Exception:
+        pass
+    return False
+
+async def human_browsing_pattern(page, messages: List[str]):
+    """Simula padrões de navegação humanos"""
+    try:
+        scroll_actions = random.randint(2, 4)
+        for _ in range(scroll_actions):
+            scroll_amount = random.randint(200, 600)
+            await page.evaluate(f"""
+                window.scrollBy({{
+                    top: {scroll_amount},
+                    behavior: 'smooth'
+                }});
+            """)
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            if random.random() < 0.3:
+                await page.evaluate("""
+                    window.scrollBy({
+                        top: -100,
+                        behavior: 'smooth'
+                    });
+                """)
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+    except Exception:
+        pass
+
+async def human_reading_behavior(page, messages: List[str]):
+    """Simula tempo de leitura humano"""
+    try:
+        content = await page.content()
+        word_count = len(content.split())
+        reading_time = max(1.5, min(6, word_count / 300))
+        reading_time *= random.uniform(0.8, 1.3)
+        await asyncio.sleep(reading_time)
+    except Exception:
+        pass
+
+class HumanTiming:
+    def __init__(self):
+        self.think_times = {
+            "simple_field": (0.3, 1.2),
+            "complex_field": (0.8, 2.0),
+            "decision": (1.5, 4.0),
+            "review": (2.0, 5.0)
+        }
+    async def think(self, field_type: str = "simple_field"):
+        min_time, max_time = self.think_times.get(field_type, (0.5, 1.5))
+        think_time = random.uniform(min_time, max_time)
+        await asyncio.sleep(think_time)
+    async def random_break(self):
+        if random.random() < 0.08:
+            await asyncio.sleep(random.uniform(2.0, 5.0))
+        elif random.random() < 0.25:
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+# --------------------------
 # Playwright helpers
 # --------------------------
-async def fill_field(page, selector: str, value: str, messages: List[str]) -> bool:
+async def fill_field(page, selector: str, value: str, messages: List[str], human: bool = True) -> bool:
     if not value:
         return False
     try:
@@ -160,6 +339,11 @@ async def fill_field(page, selector: str, value: str, messages: List[str]) -> bo
         await loc.wait_for(state="visible", timeout=8000)
         if await loc.is_visible():
             await loc.scroll_into_view_if_needed()
+            if human and random.random() < 0.7:
+                if await human_type(page, selector, value, messages):
+                    log_message(messages, f"✓ Digitou {selector[:45]} -> '{value[:42]}'")
+                    await asyncio.sleep(random.uniform(0.3, 0.9))
+                    return True
             await loc.fill(value)
             log_message(messages, f"✓ Preencheu {selector[:45]} -> '{value[:42]}'")
             await asyncio.sleep(random.uniform(0.3, 0.7))
@@ -235,15 +419,20 @@ async def check_required_errors(page, messages: List[str]) -> List[str]:
         log_message(messages, f"⚠ Problemas de validação: {problems}")
     return problems
 
-async def fill_by_possible_labels(page, labels: List[str], value: str, messages: List[str]) -> bool:
-    """Tenta preencher campo por vários labels possíveis"""
+async def fill_by_possible_labels(page, labels: List[str], value: str, messages: List[str], human: bool = True) -> bool:
+    """Tenta preencher campo por vários labels possíveis com comportamento humano"""
     if not value:
         return False
+    timing = HumanTiming()
     for lb in labels:
         try:
             el = page.get_by_label(lb)
+            if human and random.random() < 0.6:
+                await timing.think("simple_field")
             await el.fill(value, timeout=8000)
             log_message(messages, f"✓ Preenchido por label '{lb}' -> '{value[:40]}'")
+            if human:
+                await timing.random_break()
             return True
         except Exception:
             continue
@@ -494,6 +683,52 @@ async def try_recaptcha_checkbox(page, messages: List[str]) -> bool:
         return True
     except Exception:
         return False
+
+async def solve_simple_text_captcha(page, messages: List[str]) -> bool:
+    """Tenta resolver CAPTCHAs de texto simples"""
+    try:
+        text_captcha = page.locator("img[src*='captcha'], .simple-captcha, #captcha-image")
+        if await text_captcha.count() > 0:
+            log_message(messages, "🔍 CAPTCHA de texto simples detectado")
+            # Aqui poderia usar OCR, mas por agora skip
+            return False
+    except Exception:
+        pass
+    return False
+
+async def solve_audio_captcha(page, messages: List[str]) -> bool:
+    """Tenta usar a versão áudio do CAPTCHA"""
+    try:
+        audio_btn = page.locator("[aria-label*='audio' i], [title*='audio' i], #recaptcha-audio-button").first
+        if await audio_btn.is_visible(timeout=2000):
+            log_message(messages, "🔊 Botão de áudio CAPTCHA encontrado")
+            await audio_btn.click()
+            await asyncio.sleep(1.5)
+            # Aqui poderia fazer speech-to-text, mas por agora skip
+            return False
+    except Exception:
+        pass
+    return False
+
+async def solve_captcha_improved(page, messages: List[str]) -> bool:
+    """Versão melhorada com fallbacks"""
+    log_message(messages, "🛡️ Iniciando resolução de CAPTCHA...")
+    
+    # 1. Tentar serviços pagos (2captcha)
+    if TWOCAPTCHA_AVAILABLE and os.getenv("TWOCAPTCHA_API_KEY"):
+        if await solve_captcha(page, messages):
+            return True
+    
+    # 2. Fallback: CAPTCHAs simples
+    if await solve_simple_text_captcha(page, messages):
+        return True
+    
+    # 3. Fallback: Versão áudio
+    if await solve_audio_captcha(page, messages):
+        return True
+    
+    log_message(messages, "⚠️ Não foi possível resolver CAPTCHA automaticamente")
+    return False
 
 async def solve_captcha(page, messages: List[str]) -> bool:
     """
@@ -1121,6 +1356,57 @@ async def execute_vision_instructions(page, instructions: List[object], messages
     return executed_count > 0
 
 
+async def verify_application_success(page, messages: List[str]) -> bool:
+    """Verifica se a aplicação foi bem sucedida"""
+    try:
+        html = (await page.content()).lower()
+        success_indicators = [
+            "thank you for applying",
+            "application received",
+            "successfully submitted",
+            "we'll be in touch",
+            "application submitted",
+            "candidatura recebida",
+            "obrigado"
+        ]
+        for indicator in success_indicators:
+            if indicator in html:
+                log_message(messages, f"✅ Sucesso confirmado: '{indicator}'")
+                return True
+        url = page.url.lower()
+        if "success" in url or "confirmation" in url or "thank" in url:
+            log_message(messages, "✅ Sucesso confirmado via URL")
+            return True
+    except Exception as e:
+        log_message(messages, f"⚠️ Erro ao verificar sucesso: {e}")
+    return False
+
+async def handle_platform_specific_fields(page, platform: str, user_data: Dict, messages: List[str]):
+    """Campos específicos por plataforma"""
+    if platform == "greenhouse":
+        try:
+            hear_about = page.locator("input[name*='hear' i], select[name*='hear' i]").first
+            if await hear_about.count() > 0:
+                field_type = await hear_about.get_attribute("type")
+                if field_type == "text":
+                    await hear_about.fill("LinkedIn")
+                else:
+                    try:
+                        await hear_about.select_option(label="LinkedIn")
+                    except Exception:
+                        await hear_about.select_option(index=1)
+                log_message(messages, "✓ Preenchido 'How did you hear about us?'")
+        except Exception:
+            pass
+    elif platform == "lever":
+        try:
+            portfolio = page.locator("input[name*='portfolio' i], input[name*='website' i]").first
+            if await portfolio.count() > 0 and user_data.get("portfolio"):
+                await portfolio.fill(user_data["portfolio"])
+                log_message(messages, "✓ Preenchido portfolio/website")
+        except Exception:
+            pass
+
 async def detect_success(page, job_url: str, messages: List[str]) -> bool:
     try:
         await page.wait_for_timeout(1200)
@@ -1225,19 +1511,48 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
             """)
 
             log_message(messages, f"Iniciando candidatura: {job_url}")
+            step_start = time.time()
             await page.goto(job_url, wait_until="domcontentloaded")
-            await asyncio.sleep(1.2)
+            app_logger.log_performance("page_load", time.time() - step_start)
+            app_state.current_step = "page_loaded"
+            
+            # 🎯 Detectar plataforma
+            step_start = time.time()
+            platform_info = await detect_application_platform(page, messages)
+            app_state.platform_detected = platform_info["platform"]
+            app_logger.log_performance("platform_detection", time.time() - step_start)
+            
+            # 🎭 Comportamento humano: tempo de leitura inicial
+            await human_reading_behavior(page, messages)
+            await human_browsing_pattern(page, messages)
+            
+            timing = HumanTiming()
+            await timing.think("review")
+            
             await try_open_apply_modal(page, messages)
+            app_state.current_step = "form_opened"
             if pdf_bytes:
+                step_start = time.time()
                 await upload_resume(page, pdf_bytes, messages)
+                app_logger.log_performance("cv_upload", time.time() - step_start)
+                app_state.filled_fields.add("resume")
 
             # Expandir secções colapsadas primeiro
             await expand_collapsed_sections(page, messages)
+            app_state.current_step = "filling_form"
+            
+            # 🎭 Movimento de mouse humano
+            await human_mouse_movement(page, messages)
 
-            # Preenchimento por label (mais resiliente)
-            await fill_by_possible_labels(page, ["Full name", "Name", "Nome completo"], user_data.get("full_name", ""), messages)
-            await fill_by_possible_labels(page, ["Email", "E-mail"], user_data.get("email", ""), messages)
-            await fill_by_possible_labels(page, ["Phone", "Mobile", "Telefone"], user_data.get("phone", ""), messages)
+            # Preenchimento por label com comportamento humano
+            step_start = time.time()
+            if await fill_by_possible_labels(page, ["Full name", "Name", "Nome completo"], user_data.get("full_name", ""), messages, human=True):
+                app_state.filled_fields.add("full_name")
+            if await fill_by_possible_labels(page, ["Email", "E-mail"], user_data.get("email", ""), messages, human=True):
+                app_state.filled_fields.add("email")
+            if await fill_by_possible_labels(page, ["Phone", "Mobile", "Telefone"], user_data.get("phone", ""), messages, human=True):
+                app_state.filled_fields.add("phone")
+            app_logger.log_performance("basic_fields", time.time() - step_start)
 
             filled_name = await fill_field(page, SELECTORS["full_name"], user_data.get("full_name", ""), messages)
             if not filled_name and user_data.get("full_name"):
@@ -1250,39 +1565,47 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
             await fill_field(page, SELECTORS["email"], user_data.get("email", ""), messages)
             await fill_field(page, SELECTORS["phone"], user_data.get("phone", ""), messages)
 
-            # Location com autocomplete inteligente
+            # Location com autocomplete inteligente e comportamento humano
             loc_val = user_data.get("location") or user_data.get("current_location", "")
             if loc_val:
-                # Tenta método específico para autocomplete primeiro
+                timing = HumanTiming()
+                await timing.think("complex_field")
                 if not await fill_autocomplete_location(page, loc_val, messages):
-                    # Fallback para label
-                    if not await fill_by_possible_labels(page, ["Location", "City", "Location (City)"], loc_val, messages):
-                        # Fallback para selector CSS
+                    if not await fill_by_possible_labels(page, ["Location", "City", "Location (City)"], loc_val, messages, human=True):
                         if not await fill_autocomplete(page, SELECTORS["location"], loc_val, messages):
-                            await fill_field(page, SELECTORS["location"], loc_val, messages)
+                            await fill_field(page, SELECTORS["location"], loc_val, messages, human=True)
 
-            # Empresa atual (tentar por label primeiro)
-            if not await fill_by_possible_labels(page, ["Current company", "Company", "Empresa atual"], user_data.get("current_company", ""), messages):
-                await fill_field(page, SELECTORS["current_company"], user_data.get("current_company", ""), messages)
+            # Empresa atual com comportamento humano
+            timing = HumanTiming()
+            await timing.think("complex_field")
+            if not await fill_by_possible_labels(page, ["Current company", "Company", "Empresa atual"], user_data.get("current_company", ""), messages, human=True):
+                await fill_field(page, SELECTORS["current_company"], user_data.get("current_company", ""), messages, human=True)
 
-            # Localização atual (autocomplete/label)
+            # Localização atual
             cloc_val = user_data.get("current_location", "")
             if cloc_val:
-                if not await fill_by_possible_labels(page, ["Current location", "City", "Cidade"], cloc_val, messages):
+                await timing.random_break()
+                if not await fill_by_possible_labels(page, ["Current location", "City", "Cidade"], cloc_val, messages, human=True):
                     if not await fill_autocomplete(page, SELECTORS["current_location"], cloc_val, messages):
-                        await fill_field(page, SELECTORS["current_location"], cloc_val, messages)
+                        await fill_field(page, SELECTORS["current_location"], cloc_val, messages, human=True)
 
             # Expectativas salariais
-            if not await fill_by_possible_labels(page, ["Salary", "Salary expectations", "Compensation", "Desired salary"], user_data.get("salary_expectations", ""), messages):
-                await fill_field(page, SELECTORS["salary"], user_data.get("salary_expectations", ""), messages)
+            await timing.think("decision")
+            if not await fill_by_possible_labels(page, ["Salary", "Salary expectations", "Compensation", "Desired salary"], user_data.get("salary_expectations", ""), messages, human=True):
+                await fill_field(page, SELECTORS["salary"], user_data.get("salary_expectations", ""), messages, human=True)
 
             # Período de aviso / disponibilidade
-            if not await fill_by_possible_labels(page, ["Notice period", "Availability", "Earliest start date", "Disponibilidade"], user_data.get("notice_period", ""), messages):
-                await fill_field(page, SELECTORS["notice"], user_data.get("notice_period", ""), messages)
+            await timing.random_break()
+            if not await fill_by_possible_labels(page, ["Notice period", "Availability", "Earliest start date", "Disponibilidade"], user_data.get("notice_period", ""), messages, human=True):
+                await fill_field(page, SELECTORS["notice"], user_data.get("notice_period", ""), messages, human=True)
 
             # Informação adicional / carta de apresentação
-            if not await fill_by_possible_labels(page, ["Additional information", "Cover letter", "Notes", "Message", "Informação adicional"], user_data.get("additional_info", ""), messages):
-                await fill_field(page, SELECTORS["additional"], user_data.get("additional_info", ""), messages)
+            await timing.think("decision")
+            if not await fill_by_possible_labels(page, ["Additional information", "Cover letter", "Notes", "Message", "Informação adicional"], user_data.get("additional_info", ""), messages, human=True):
+                await fill_field(page, SELECTORS["additional"], user_data.get("additional_info", ""), messages, human=True)
+            
+            # Campos específicos da plataforma
+            await handle_platform_specific_fields(page, app_state.platform_detected, user_data, messages)
 
             # Verificar e corrigir campos obrigatórios
             problems = await check_required_errors(page, messages)
@@ -1333,8 +1656,16 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     # Consent/Privacy (não incluir reCAPTCHA por agora)
                     await try_click_privacy_consent(page, messages)
                     
-                    # Tentar resolver CAPTCHA se presente (reCAPTCHA ou hCaptcha)
-                    await solve_captcha(page, messages)
+                    # Tentar resolver CAPTCHA com retry inteligente
+                    captcha_attempt = 0
+                    while captcha_attempt < 3:
+                        if await solve_captcha_improved(page, messages):
+                            app_state.captcha_solved = True
+                            log_message(messages, "✅ CAPTCHA resolvido")
+                            break
+                        captcha_attempt += 1
+                        if not await retry_system.should_retry("captcha", captcha_attempt, messages):
+                            break
 
                     # Forçar HTML5 validity
                     try:
@@ -1350,8 +1681,18 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                         await navigate_next_steps(page, messages, max_steps=3)
                     except Exception:
                         pass
+                    
+                    # 🎭 Scroll final para rever formulário (comportamento humano)
+                    try:
+                        await page.evaluate("window.scrollTo(0, 0)")
+                        await asyncio.sleep(random.uniform(0.8, 2.0))
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        timing = HumanTiming()
+                        await timing.think("review")
+                    except Exception:
+                        pass
 
-                    # Clique robusto no Submit
+                    # Clique robusto no Submit com comportamento humano
                     try:
                         import re as _re
                         submit_btn = page.get_by_role("button", name=_re.compile("submit", _re.I)).first
@@ -1370,8 +1711,17 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                             )
                             await submit_btn.scroll_into_view_if_needed()
                             if allow_submit:
-                                await submit_btn.click(timeout=5000)
-                                log_message(messages, "✓ Clique em Submit (robusto)")
+                                # 🎭 Clique humano no submit
+                                timing = HumanTiming()
+                                await timing.think("review")
+                                
+                                # Tentar clique humano primeiro
+                                submit_selector = f"button:has-text('Submit')"
+                                if not await human_click(page, submit_selector, messages):
+                                    # Fallback para clique normal
+                                    await submit_btn.click(timeout=5000)
+                                
+                                log_message(messages, "✓ Clique em Submit (humano)")
                             else:
                                 status = "awaiting_consent"
                                 log_message(messages, "⚠ allow_submit=False — não submetido")
@@ -1380,8 +1730,11 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                             log_message(messages, "✗ Botão Submit não encontrado")
                     except Exception as e:
                         log_message(messages, f"✗ Erro ao clicar Submit (robusto): {e}")
+                        app_logger.log_error("submit_click", str(e))
+                        app_state.encountered_issues.append(f"submit_error: {str(e)}")
 
                     await asyncio.sleep(2.0)
+                    app_state.current_step = "submitted"
                     
                     # Tirar screenshot para análise
                     try:
@@ -1442,6 +1795,10 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
         status = "error"
         ok = False
 
+    # Calcular métricas finais
+    total_time = time.time() - app_logger.start_time
+    app_logger.log_performance("total_execution", total_time)
+    
     elapsed = round(time.time() - t0, 2)
     return {
         "ok": ok,
@@ -1450,6 +1807,9 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
         "elapsed_s": elapsed,
         "log": messages,
         "screenshot": screenshot_b64,
+        "state": app_state.to_dict(),
+        "metrics": app_logger.performance_metrics,
+        "errors": app_logger.error_stats
     }
 
 # --------------------------
