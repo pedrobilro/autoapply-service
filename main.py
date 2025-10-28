@@ -472,6 +472,8 @@ async def solve_captcha(page, messages: List[str]) -> bool:
     Tenta resolver CAPTCHA (reCAPTCHA v2 ou hCaptcha) usando serviço 2captcha.com
     Requer TWOCAPTCHA_API_KEY como variável de ambiente
     """
+    log_message(messages, "🔎 Verificando presença de CAPTCHA...")
+    
     if not TWOCAPTCHA_AVAILABLE:
         log_message(messages, "⚠️ Biblioteca 2captcha-python não disponível")
         return False
@@ -482,26 +484,38 @@ async def solve_captcha(page, messages: List[str]) -> bool:
         site_key = None
         
         # Verificar hCaptcha primeiro
+        log_message(messages, "   Verificando hCaptcha...")
         try:
             site_key = await page.evaluate("""
                 () => {
+                    // Procurar por elementos hCaptcha
                     const hcaptchaDiv = document.querySelector('[data-sitekey]');
-                    if (hcaptchaDiv) {
-                        const iframe = document.querySelector('iframe[src*="hcaptcha"]');
-                        if (iframe) return { type: 'hcaptcha', key: hcaptchaDiv.getAttribute('data-sitekey') };
+                    const hcaptchaIframe = document.querySelector('iframe[src*="hcaptcha"]');
+                    
+                    if (hcaptchaDiv && hcaptchaIframe) {
+                        return { type: 'hcaptcha', key: hcaptchaDiv.getAttribute('data-sitekey') };
                     }
+                    
+                    // Fallback: procurar por classe h-captcha
+                    const hcaptchaClass = document.querySelector('.h-captcha');
+                    if (hcaptchaClass) {
+                        const key = hcaptchaClass.getAttribute('data-sitekey');
+                        if (key) return { type: 'hcaptcha', key: key };
+                    }
+                    
                     return null;
                 }
             """)
             if site_key:
                 captcha_type = "hcaptcha"
                 site_key = site_key.get('key') if isinstance(site_key, dict) else site_key
-                log_message(messages, f"🔍 Detectado hCaptcha (site key: {site_key[:20] if site_key else ''}...)")
-        except:
-            pass
+                log_message(messages, f"🔍 ✓ Detectado hCaptcha (site key: {site_key[:20] if site_key else ''}...)")
+        except Exception as e:
+            log_message(messages, f"   hCaptcha check error: {str(e)[:50]}")
         
         # Verificar reCAPTCHA v2
         if not captcha_type:
+            log_message(messages, "   Verificando reCAPTCHA...")
             try:
                 site_key = await page.evaluate("""
                     () => {
@@ -514,12 +528,12 @@ async def solve_captcha(page, messages: List[str]) -> bool:
                 """)
                 if site_key:
                     captcha_type = "recaptcha"
-                    log_message(messages, f"🔍 Detectado reCAPTCHA v2 (site key: {site_key[:20]}...)")
-            except:
-                pass
+                    log_message(messages, f"🔍 ✓ Detectado reCAPTCHA v2 (site key: {site_key[:20]}...)")
+            except Exception as e:
+                log_message(messages, f"   reCAPTCHA check error: {str(e)[:50]}")
         
         if not captcha_type or not site_key:
-            log_message(messages, "Nenhum CAPTCHA detectado na página")
+            log_message(messages, "✓ Nenhum CAPTCHA detectado na página")
             return False
         
         # Obter API key do 2captcha
@@ -585,11 +599,13 @@ async def solve_captcha(page, messages: List[str]) -> bool:
             await asyncio.sleep(2)  # Dar tempo para o site processar
             return True
         else:
-            log_message(messages, f"✗ Falha ao resolver {captcha_type.upper()}")
+            log_message(messages, f"✗ Falha ao resolver {captcha_type.upper()} - sem token")
             return False
             
     except Exception as e:
-        log_message(messages, f"✗ Erro ao resolver CAPTCHA: {e}")
+        log_message(messages, f"✗ Erro CRÍTICO ao resolver CAPTCHA: {type(e).__name__}: {str(e)[:100]}")
+        import traceback
+        log_message(messages, f"   Traceback: {traceback.format_exc()[:200]}")
         return False
 
 async def analyze_screenshot_with_vision(screenshot_b64: str, messages: List[str], openai_key: Optional[str] = None, cv_text: Optional[str] = None, user_data: Optional[Dict[str, str]] = None) -> Dict:
