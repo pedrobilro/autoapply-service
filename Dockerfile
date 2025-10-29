@@ -19,6 +19,5 @@ ENV PORT=8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://localhost:${PORT}/healthz || exit 1
 
-# Arranque FastAPI
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
-
+# Arranque FastAPI - usando shell form para expandir $PORT
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
