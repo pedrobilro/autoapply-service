@@ -1550,11 +1550,11 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
         async with async_playwright() as p:
             # Usar Bright Data Browser API se credenciais estiverem disponíveis
             if use_brightdata:
-                log_message(messages, "🌐 Conectando via Bright Data Browser API...")
+                log_message(messages, "🌐 Conectando via Bright Data Browser API (CAPTCHA automático)...")
                 browser_endpoint = f"wss://{brightdata_username}:{brightdata_password}@brd.superproxy.io:9222"
                 try:
                     browser = await p.chromium.connect_over_cdp(browser_endpoint)
-                    log_message(messages, "✓ Conectado ao Bright Data Browser API")
+                    log_message(messages, "✓ Conectado ao Bright Data - CAPTCHAs serão resolvidos automaticamente")
                 except Exception as e:
                     log_message(messages, f"⚠ Falha ao conectar Bright Data: {e}")
                     log_message(messages, "🔄 Usando Playwright local como fallback...")
@@ -1750,16 +1750,20 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     # Consent/Privacy (não incluir reCAPTCHA por agora)
                     await try_click_privacy_consent(page, messages)
                     
-                    # Tentar resolver CAPTCHA com retry inteligente
-                    captcha_attempt = 0
-                    while captcha_attempt < 3:
-                        if await solve_captcha_improved(page, messages):
-                            app_state.captcha_solved = True
-                            log_message(messages, "✅ CAPTCHA resolvido")
-                            break
-                        captcha_attempt += 1
-                        if not await retry_system.should_retry("captcha", captcha_attempt, messages):
-                            break
+                    # Tentar resolver CAPTCHA (só se não estiver usando Bright Data)
+                    if use_brightdata:
+                        log_message(messages, "⏭️ Bright Data ativo - CAPTCHAs são resolvidos automaticamente, pulando resolução manual")
+                    else:
+                        captcha_attempt = 0
+                        while captcha_attempt < 3:
+                            if await solve_captcha_improved(page, messages):
+                                app_state.captcha_solved = True
+                                log_message(messages, "✅ CAPTCHA resolvido")
+                                break
+                            captcha_attempt += 1
+                            if not await retry_system.should_retry("captcha", captcha_attempt, messages):
+                                break
+
 
                     # Forçar HTML5 validity
                     try:
