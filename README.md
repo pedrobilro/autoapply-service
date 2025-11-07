@@ -2,6 +2,8 @@
 
 Microserviço Python com Playwright para automatizar candidaturas. Inclui parsing de CVs, validação inteligente e screenshots.
 
+**Novo:** Suporte para Bright Data Browser API com resolução automática de CAPTCHAs.
+
 ## 🚀 Deploy no Railway
 
 ### 1. Preparar GitHub
@@ -24,7 +26,15 @@ Microserviço Python com Playwright para automatizar candidaturas. Inclui parsin
 2. Clica "Generate Domain"
 3. Copia o URL (ex: `https://auto-apply-production.up.railway.app`)
 
-### 4. Configurar no Lovable Cloud
+### 4. Configurar Bright Data (Opcional mas Recomendado)
+Para resolução automática de CAPTCHAs:
+1. No dashboard Railway → "Variables"
+2. Adiciona as variáveis de ambiente:
+   - `BRIGHTDATA_USERNAME`: teu username da Bright Data
+   - `BRIGHTDATA_PASSWORD`: tua password da Bright Data
+3. **Se não configurares**, o sistema usa Playwright local (sem resolução de CAPTCHA)
+
+### 5. Configurar no Lovable Cloud
 1. Adiciona o secret `PYTHON_SERVICE_URL` com o URL do Railway
 2. A edge function `auto-apply-external` já está configurada
 
