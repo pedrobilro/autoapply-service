@@ -1514,6 +1514,7 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
     messages: List[str] = []
     app_state = ApplicationState()
     app_logger = ApplicationLogger()
+    retry_system = SmartRetrySystem()  # Instanciar retry_system aqui
     t0 = time.time()
     job_url = user_data.get("job_url", "")
     plan_only = bool(user_data.get("plan_only", False))
@@ -1539,14 +1540,33 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
     if missing:
         return {"ok": False, "status": "missing_fields", "missing": missing, "log": messages}
 
+    # Bright Data Browser API credentials
+    brightdata_username = os.getenv("BRIGHTDATA_USERNAME")
+    brightdata_password = os.getenv("BRIGHTDATA_PASSWORD")
+    
+    use_brightdata = brightdata_username and brightdata_password
+
     try:
         async with async_playwright() as p:
-            # Argumentos anti-detecção de bot e CAPTCHA
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
+            # Usar Bright Data Browser API se credenciais estiverem disponíveis
+            if use_brightdata:
+                log_message(messages, "🌐 Conectando via Bright Data Browser API...")
+                browser_endpoint = f"wss://{brightdata_username}:{brightdata_password}@brd.superproxy.io:9222"
+                try:
+                    browser = await p.chromium.connect_over_cdp(browser_endpoint)
+                    log_message(messages, "✓ Conectado ao Bright Data Browser API")
+                except Exception as e:
+                    log_message(messages, f"⚠ Falha ao conectar Bright Data: {e}")
+                    log_message(messages, "🔄 Usando Playwright local como fallback...")
+                    use_brightdata = False
+            
+            if not use_brightdata:
+                # Argumentos anti-detecção de bot e CAPTCHA (fallback local)
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
                     "--disable-web-security",
                     "--disable-features=IsolateOrigins,site-per-process",
