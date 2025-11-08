@@ -1294,14 +1294,23 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
                         logs.append(f"🔌 Connecting to Bright Data Browser API...")
                         logger.info(f"Connecting to Browser API: {ws_endpoint[:50]}...")
                         
-                        browser = await p.chromium.connect_over_cdp(ws_endpoint)
+                        # Increase timeout to 60s for international connections
+                        browser = await p.chromium.connect_over_cdp(ws_endpoint, timeout=60000)
                         telemetry["bd_browser_api_connected"] = True
                         logs.append("✅ Bright Data Browser API connected")
                         logger.info("✅ Bright Data Browser API connected")
                     except Exception as e:
-                        logs.append(f"❌ Failed to connect to Browser API: {str(e)[:100]}")
+                        logs.append(f"❌ Failed to connect to Browser API: {str(e)}")
                         logger.error(f"Browser API connection failed: {e}")
-                        raise Exception(f"Bright Data Browser API connection failed: {str(e)}")
+                        
+                        # Fallback to local browser instead of failing completely
+                        logs.append("⚠️ Falling back to local browser...")
+                        browser = await p.chromium.launch(
+                            headless=True,
+                            args=["--no-sandbox", "--disable-setuid-sandbox"]
+                        )
+                        telemetry["bd_browser_api_connected"] = False
+                        telemetry["fallback_to_local"] = True
             else:
                 # Launch local browser without proxy
                 launch_options = {
