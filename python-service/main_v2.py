@@ -788,6 +788,12 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
     logs.append(f"🎯 Job URL: {request.job_url}")
     logs.append(f"🔧 Vision AI: {'Enabled' if openai_key else 'Disabled (no API key)'}")
     logs.append(f"🔧 Use Bright Data: {request.use_bright_data}")
+    logs.append(f"📋 Candidate Data:")
+    logs.append(f"   - Full Name: {request.full_name or 'MISSING'}")
+    logs.append(f"   - Email: {request.email or 'MISSING'}")
+    logs.append(f"   - Phone: {request.phone or 'MISSING'}")
+    logs.append(f"   - Location: {request.location or 'MISSING'}")
+    logs.append(f"   - Current Company: {request.current_company or 'MISSING'}")
     
     browser: Optional[Browser] = None
     
@@ -916,7 +922,17 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
             screenshot_b64 = screenshot_pre.split(",")[1] if "," in screenshot_pre else screenshot_pre
             
             # STEP 2: Vision AI Analysis
-            form_analysis = await analyze_form_with_vision(screenshot_b64, openai_key)
+            if not openai_key:
+                logs.append("⚠️ No OpenAI API key - skipping Vision AI analysis")
+                logger.warning("No OpenAI API key available - will use platform adapters")
+                form_analysis = None
+            else:
+                logs.append("🤖 Starting Vision AI analysis...")
+                form_analysis = await analyze_form_with_vision(screenshot_b64, openai_key)
+                if form_analysis:
+                    logs.append(f"✅ Vision AI analysis complete: {form_analysis.keys()}")
+                else:
+                    logs.append("❌ Vision AI analysis returned None")
             
             if form_analysis and form_analysis.get("fields"):
                 telemetry["vision_analysis_used"] = True
