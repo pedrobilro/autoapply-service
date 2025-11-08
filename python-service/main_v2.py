@@ -72,6 +72,7 @@ class AutoApplyRequest(BaseModel):
     use_bright_data: bool = True
     use_mcp: UseMCP = UseMCP.AUTO
     auto_captcha_allowed: bool = True
+    debug_mode: bool = False  # NEW: Enable ultra-detailed logging and HTML dumps
     answers_override: Dict[str, str] = Field(default_factory=dict)
     
     # Candidate data
@@ -247,6 +248,70 @@ async def fill_field_robust(page: Page, label: str, value: str, logs: List[str])
         logger.error(f"Traceback: {traceback.format_exc()}")
         return False
 
+async def fill_field_with_css_fallback(page: Page, field_name: str, value: str, logs: List[str]) -> bool:
+    """
+    Tenta preencher campo usando:
+    1. Engine atual (resolve_locator + fill_field_robust)
+    2. Fallback: Seletores CSS diretos do FIELD_SELECTORS
+    """
+    if not value:
+        logger.debug(f"⏭️ Skipping '{field_name}' - empty value")
+        return False
+    
+    # Fase 1: Tentar engine atual
+    logger.info(f"🔄 Phase 1: Trying current engine for '{field_name}'")
+    success = await fill_field_robust(page, field_name, value, logs)
+    if success:
+        return True
+    
+    # Fase 2: Fallback CSS direto
+    logger.warning(f"⚠️ Phase 1 failed for '{field_name}', trying CSS fallback...")
+    logs.append(f"🔄 Tentando seletores CSS diretos para '{field_name}'...")
+    
+    if field_name not in FIELD_SELECTORS:
+        logger.error(f"❌ No CSS selectors defined for '{field_name}'")
+        return False
+    
+    selectors = FIELD_SELECTORS[field_name]
+    selector_str = ", ".join(selectors)
+    logger.debug(f"  CSS selectors: {selector_str}")
+    
+    try:
+        locator = page.locator(selector_str).first
+        count = await locator.count()
+        logger.debug(f"  → Found {count} elements with CSS selectors")
+        
+        if count > 0:
+            is_visible = await locator.is_visible()
+            logger.debug(f"  → Visible: {is_visible}")
+            
+            if is_visible:
+                await locator.click()
+                await asyncio.sleep(0.1)
+                await locator.fill(value)
+                await asyncio.sleep(0.2)
+                
+                # Verificar
+                filled_value = await locator.input_value()
+                if filled_value == value:
+                    logs.append(f"✅ CSS fallback success for '{field_name}': {value}")
+                    logger.info(f"✅ CSS FALLBACK SUCCESS: '{field_name}' = '{value}'")
+                    return True
+                else:
+                    logs.append(f"⚠️ CSS fallback mismatch for '{field_name}'")
+                    logger.warning(f"⚠️ CSS FALLBACK MISMATCH: '{field_name}'")
+                    return False
+            else:
+                logger.warning(f"⚠️ CSS locator not visible for '{field_name}'")
+        else:
+            logger.warning(f"⚠️ No CSS elements found for '{field_name}'")
+    except Exception as e:
+        logs.append(f"❌ CSS fallback error for '{field_name}': {str(e)}")
+        logger.error(f"❌ CSS FALLBACK EXCEPTION for '{field_name}': {e}")
+        return False
+    
+    return False
+
 # ============================================================================
 # BRIGHT DATA INTEGRATION
 # ============================================================================
@@ -272,6 +337,72 @@ def get_bright_data_browser_api_endpoint(username: str, password: str) -> Option
     
     # Format: wss://username:password@brd.superproxy.io:9222
     return f"wss://{username}:{password}@brd.superproxy.io:9222"
+
+# ============================================================================
+# DIRECT CSS SELECTORS (FALLBACK STRATEGY)
+# ============================================================================
+
+FIELD_SELECTORS = {
+    "full_name": [
+        "input[name='name']",
+        "input[name='fullName']",
+        "input[name='full_name']",
+        "input[aria-label*='name' i]",
+        "input[placeholder*='full name' i]",
+        "input[placeholder*='your name' i]",
+        "input[id*='name' i]"
+    ],
+    "first_name": [
+        "input[name='firstName']",
+        "input[name='first_name']",
+        "input[name='first-name']",
+        "input[aria-label*='first' i]",
+        "input[placeholder*='first' i]",
+        "input[id*='first' i]"
+    ],
+    "last_name": [
+        "input[name='lastName']",
+        "input[name='last_name']",
+        "input[name='last-name']",
+        "input[aria-label*='last' i]",
+        "input[placeholder*='last' i]",
+        "input[id*='last' i]"
+    ],
+    "email": [
+        "input[type='email']",
+        "input[name='email']",
+        "input[aria-label*='email' i]",
+        "input[placeholder*='email' i]",
+        "input[id*='email' i]"
+    ],
+    "phone": [
+        "input[type='tel']",
+        "input[name='phone']",
+        "input[name='mobile']",
+        "input[aria-label*='phone' i]",
+        "input[placeholder*='phone' i]",
+        "input[id*='phone' i]"
+    ],
+    "location": [
+        "input[name='location']",
+        "input[name='city']",
+        "input[aria-label*='location' i]",
+        "input[placeholder*='location' i]",
+        "input[placeholder*='city' i]"
+    ],
+    "company": [
+        "input[name='company']",
+        "input[name='current_company']",
+        "input[aria-label*='company' i]",
+        "input[placeholder*='company' i]"
+    ],
+    "linkedin": [
+        "input[name='linkedin']",
+        "input[name='linkedin_url']",
+        "input[aria-label*='linkedin' i]",
+        "input[placeholder*='linkedin' i]"
+    ]
+}
 
 async def analyze_screenshot_with_vision(
     screenshot_b64: str, 
@@ -414,7 +545,7 @@ RULES:
 
 async def execute_vision_instructions(page: Page, instructions: List[Dict], logs: List[str]) -> int:
     """
-    Executa as instruções fornecidas pelo Vision AI.
+    Executa as instruções fornecidas pelo Vision AI com retry logic.
     Retorna número de instruções executadas com sucesso.
     """
     if not instructions:
@@ -430,11 +561,26 @@ async def execute_vision_instructions(page: Page, instructions: List[Dict], logs
             selector = inst.get("selector", "")
             value = inst.get("value", "")
             
-            logger.debug(f"  {idx}. {action} '{selector}' = '{value}'")
+            if not selector or not value:
+                logger.warning(f"  ⚠️ {idx}. Instrução inválida (sem selector/value)")
+                continue
             
-            if action == "fill" and selector and value:
-                if await fill_field_robust(page, selector, value, logs):
+            logger.info(f"  📝 {idx}/{len(instructions)}: {action} '{selector}' = '{value}'")
+            
+            if action == "fill":
+                # Primeiro tentar com CSS fallback (mais robusto)
+                success = await fill_field_with_css_fallback(page, selector, value, logs)
+                
+                # Se falhar, tentar interpretar selector como label
+                if not success:
+                    logger.debug(f"    → Retry: interpreting '{selector}' as label text")
+                    success = await fill_field_robust(page, selector, value, logs)
+                
+                if success:
                     executed += 1
+                    logger.info(f"    ✅ Instrução {idx} executada")
+                else:
+                    logger.warning(f"    ⚠️ Instrução {idx} falhou")
             elif action == "select" and selector and value:
                 # Try to select from dropdown
                 try:
@@ -442,9 +588,13 @@ async def execute_vision_instructions(page: Page, instructions: List[Dict], logs
                     if locator:
                         await locator.select_option(label=value)
                         logs.append(f"✅ Selected '{value}' in '{selector}'")
+                        logger.info(f"    ✅ Selected '{value}'")
                         executed += 1
+                    else:
+                        logger.warning(f"    ⚠️ Locator not found for select: '{selector}'")
                 except Exception as e:
-                    logger.error(f"Failed to select: {e}")
+                    logger.error(f"    ❌ Failed to select: {e}")
+            
             elif action == "check" and selector:
                 # Try to check checkbox
                 try:
@@ -452,11 +602,34 @@ async def execute_vision_instructions(page: Page, instructions: List[Dict], logs
                     if locator:
                         await locator.check()
                         logs.append(f"✅ Checked '{selector}'")
+                        logger.info(f"    ✅ Checked checkbox")
                         executed += 1
+                    else:
+                        logger.warning(f"    ⚠️ Locator not found for check: '{selector}'")
                 except Exception as e:
-                    logger.error(f"Failed to check: {e}")
+                    logger.error(f"    ❌ Failed to check: {e}")
+            
+            elif action == "click" and selector:
+                # Try to click element
+                try:
+                    locator = await resolve_locator(page, selector)
+                    if locator:
+                        await locator.click()
+                        logs.append(f"✅ Clicked '{selector}'")
+                        logger.info(f"    ✅ Clicked element")
+                        executed += 1
+                        await asyncio.sleep(0.5)
+                    else:
+                        logger.warning(f"    ⚠️ Locator not found for click: '{selector}'")
+                except Exception as e:
+                    logger.error(f"    ❌ Failed to click: {e}")
+            
+            else:
+                logger.warning(f"    ⚠️ Unknown action: '{action}'")
+        
         except Exception as e:
-            logger.error(f"Error executing instruction {idx}: {e}")
+            logger.error(f"❌ Error executing instruction {idx}: {e}")
+            logger.error(traceback.format_exc())
     
     logger.info(f"✅ Executadas {executed}/{len(instructions)} instruções")
     logs.append(f"✅ Aplicadas {executed}/{len(instructions)} correções")
@@ -564,35 +737,49 @@ async def detect_platform(page: Page, url: str) -> str:
         return "unknown"
 
 async def greenhouse_adapter(page: Page, request: AutoApplyRequest, logs: List[str]) -> Dict[str, Any]:
-    """Greenhouse-specific logic."""
+    """Greenhouse-specific logic with robust name filling."""
     logger.info("🌱 Using Greenhouse adapter")
     filled = []
     
     try:
-        # Greenhouse uses specific IDs
+        # Name: try full_name first, then split if needed
         if request.full_name:
-            # Split name
-            name_parts = request.full_name.split(" ", 1)
-            first_name = name_parts[0] if len(name_parts) > 0 else ""
-            last_name = name_parts[1] if len(name_parts) > 1 else ""
-            
-            if await fill_field_robust(page, "first name", first_name, logs):
-                filled.append("first_name")
-            if await fill_field_robust(page, "last name", last_name, logs):
-                filled.append("last_name")
+            # Phase 1: Try full name field
+            logger.info("📝 Trying full_name field first...")
+            if await fill_field_with_css_fallback(page, "full_name", request.full_name, logs):
+                filled.append("full_name")
+            else:
+                # Phase 2: Split and try first_name + last_name
+                logger.info("📝 full_name failed, splitting into first+last...")
+                name_parts = request.full_name.split(" ", 1)
+                first_name = name_parts[0] if len(name_parts) > 0 else ""
+                last_name = name_parts[1] if len(name_parts) > 1 else ""
+                
+                if first_name and await fill_field_with_css_fallback(page, "first_name", first_name, logs):
+                    filled.append("first_name")
+                if last_name and await fill_field_with_css_fallback(page, "last_name", last_name, logs):
+                    filled.append("last_name")
         
-        if request.email and await fill_field_robust(page, "email", request.email, logs):
+        if request.email and await fill_field_with_css_fallback(page, "email", request.email, logs):
             filled.append("email")
         
-        if request.phone and await fill_field_robust(page, "phone", request.phone, logs):
+        if request.phone and await fill_field_with_css_fallback(page, "phone", request.phone, logs):
             filled.append("phone")
+        
+        if request.location and await fill_field_with_css_fallback(page, "location", request.location, logs):
+            filled.append("location")
+        
+        if request.current_company and await fill_field_with_css_fallback(page, "company", request.current_company, logs):
+            filled.append("company")
+        
+        if request.linkedin_url and await fill_field_with_css_fallback(page, "linkedin", request.linkedin_url, logs):
+            filled.append("linkedin")
         
         # Resume upload
         if request.resume:
             try:
                 resume_input = page.locator('input[type="file"][name*="resume"]')
                 if await resume_input.count() > 0:
-                    # Handle base64 or URL
                     if request.resume.startswith("data:") or "base64" in request.resume:
                         logs.append("⚠️ Base64 resume upload needs file handling")
                     else:
@@ -608,19 +795,39 @@ async def greenhouse_adapter(page: Page, request: AutoApplyRequest, logs: List[s
         return {"status": "error", "filled_fields": filled, "errors": [str(e)]}
 
 async def lever_adapter(page: Page, request: AutoApplyRequest, logs: List[str]) -> Dict[str, Any]:
-    """Lever-specific logic."""
+    """Lever-specific logic with robust name filling."""
     logger.info("⚡ Using Lever adapter")
     filled = []
     
     try:
-        if request.full_name and await fill_field_robust(page, "name", request.full_name, logs):
-            filled.append("name")
+        # Name: try full_name first, then split if needed
+        if request.full_name:
+            logger.info("📝 Trying full_name field...")
+            if await fill_field_with_css_fallback(page, "full_name", request.full_name, logs):
+                filled.append("full_name")
+            else:
+                # Fallback: split into first+last
+                logger.info("📝 full_name failed, splitting...")
+                name_parts = request.full_name.split(" ", 1)
+                first_name = name_parts[0] if len(name_parts) > 0 else ""
+                last_name = name_parts[1] if len(name_parts) > 1 else ""
+                
+                if first_name and await fill_field_with_css_fallback(page, "first_name", first_name, logs):
+                    filled.append("first_name")
+                if last_name and await fill_field_with_css_fallback(page, "last_name", last_name, logs):
+                    filled.append("last_name")
         
-        if request.email and await fill_field_robust(page, "email", request.email, logs):
+        if request.email and await fill_field_with_css_fallback(page, "email", request.email, logs):
             filled.append("email")
         
-        if request.phone and await fill_field_robust(page, "phone", request.phone, logs):
+        if request.phone and await fill_field_with_css_fallback(page, "phone", request.phone, logs):
             filled.append("phone")
+        
+        if request.location and await fill_field_with_css_fallback(page, "location", request.location, logs):
+            filled.append("location")
+        
+        if request.linkedin_url and await fill_field_with_css_fallback(page, "linkedin", request.linkedin_url, logs):
+            filled.append("linkedin")
         
         return {"status": "success", "filled_fields": filled, "errors": []}
     
@@ -629,25 +836,47 @@ async def lever_adapter(page: Page, request: AutoApplyRequest, logs: List[str]) 
         return {"status": "error", "filled_fields": filled, "errors": [str(e)]}
 
 async def generic_adapter(page: Page, request: AutoApplyRequest, logs: List[str]) -> Dict[str, Any]:
-    """Generic fallback adapter."""
+    """Generic fallback adapter with robust filling."""
     logger.info("🔧 Using generic adapter")
     filled = []
     
     try:
-        # Try common field labels
-        field_mappings = [
-            ("full name", request.full_name),
-            ("name", request.full_name),
-            ("email", request.email),
-            ("phone", request.phone),
-            ("location", request.location),
-            ("current company", request.current_company),
-            ("linkedin", request.linkedin_url),
-        ]
+        # Name: try full_name first, then split if needed
+        if request.full_name:
+            logger.info("📝 Trying full_name field...")
+            if await fill_field_with_css_fallback(page, "full_name", request.full_name, logs):
+                filled.append("full_name")
+            else:
+                # Try alternative label "name"
+                if await fill_field_robust(page, "name", request.full_name, logs):
+                    filled.append("name")
+                else:
+                    # Fallback: split
+                    logger.info("📝 Splitting name into first+last...")
+                    name_parts = request.full_name.split(" ", 1)
+                    first_name = name_parts[0] if len(name_parts) > 0 else ""
+                    last_name = name_parts[1] if len(name_parts) > 1 else ""
+                    
+                    if first_name and await fill_field_with_css_fallback(page, "first_name", first_name, logs):
+                        filled.append("first_name")
+                    if last_name and await fill_field_with_css_fallback(page, "last_name", last_name, logs):
+                        filled.append("last_name")
         
-        for label, value in field_mappings:
-            if value and await fill_field_robust(page, label, value, logs):
-                filled.append(label)
+        # Other fields
+        if request.email and await fill_field_with_css_fallback(page, "email", request.email, logs):
+            filled.append("email")
+        
+        if request.phone and await fill_field_with_css_fallback(page, "phone", request.phone, logs):
+            filled.append("phone")
+        
+        if request.location and await fill_field_with_css_fallback(page, "location", request.location, logs):
+            filled.append("location")
+        
+        if request.current_company and await fill_field_with_css_fallback(page, "company", request.current_company, logs):
+            filled.append("company")
+        
+        if request.linkedin_url and await fill_field_with_css_fallback(page, "linkedin", request.linkedin_url, logs):
+            filled.append("linkedin")
         
         return {"status": "success", "filled_fields": filled, "errors": []}
     
@@ -1163,6 +1392,32 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
             # Extract base64 from screenshot
             screenshot_b64 = screenshot_pre.split(",")[1] if "," in screenshot_pre else screenshot_pre
             
+            # DEBUG MODE: HTML dump and input list
+            if request.debug_mode:
+                logs.append("🐛 DEBUG MODE: Extracting page information...")
+                try:
+                    # List all input fields
+                    all_inputs = await page.locator("input, textarea, select").all()
+                    logs.append(f"🐛 Found {len(all_inputs)} input elements:")
+                    for idx, inp in enumerate(all_inputs[:20], 1):  # Limit to 20
+                        try:
+                            tag = await inp.evaluate("el => el.tagName")
+                            name = await inp.get_attribute("name") or "no-name"
+                            id_attr = await inp.get_attribute("id") or "no-id"
+                            type_attr = await inp.get_attribute("type") or "no-type"
+                            placeholder = await inp.get_attribute("placeholder") or "no-placeholder"
+                            visible = await inp.is_visible()
+                            logs.append(f"   {idx}. <{tag.lower()}> name='{name}' id='{id_attr}' type='{type_attr}' placeholder='{placeholder}' visible={visible}")
+                        except:
+                            pass
+                    
+                    # HTML snippet of form (first 5000 chars)
+                    html_content = await page.content()
+                    logs.append(f"🐛 HTML length: {len(html_content)} chars")
+                    logs.append(f"🐛 HTML snippet (first 500 chars): {html_content[:500]}")
+                except Exception as e:
+                    logs.append(f"🐛 DEBUG extraction error: {str(e)}")
+            
             # STEP 2: Detect platform and fill fields with adapters FIRST
             platform = await detect_platform(page, request.job_url)
             telemetry["platform"] = platform
@@ -1181,6 +1436,16 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
             errors.extend(adapter_result.get("errors", []))
             
             logs.append(f"✅ Filled {len(filled_fields)} fields with adapter: {', '.join(filled_fields)}")
+            
+            # DEBUG MODE: Take intermediate screenshot after adapter fill
+            if request.debug_mode:
+                logs.append("🐛 DEBUG MODE: Taking post-adapter screenshot...")
+                try:
+                    intermediate_screenshot = await take_screenshot(page, "post_adapter")
+                    logs.append("🐛 Post-adapter screenshot captured")
+                    telemetry["screenshot_intermediate"] = intermediate_screenshot[:100] + "..."
+                except Exception as e:
+                    logs.append(f"🐛 DEBUG screenshot error: {str(e)}")
             
             # STEP 3: Vision AI validation (self-healing loop)
             if openai_key:
