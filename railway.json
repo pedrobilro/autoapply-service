@@ -2,8 +2,7 @@
   "$schema": "https://railway.app/railway.schema.json",
   "build": {
     "builder": "DOCKERFILE",
-    "dockerfilePath": "python-service/Dockerfile",
-    "watchPatterns": ["python-service/**"]
+    "dockerfilePath": "Dockerfile"
   },
   "deploy": {
     "restartPolicyType": "ON_FAILURE",
