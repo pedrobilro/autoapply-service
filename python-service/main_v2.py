@@ -111,18 +111,21 @@ def normalize_label(text: str) -> str:
 
 async def resolve_locator(page: Page, label_text: str):
     """
-    Robust locator resolution:
+    Robust locator resolution with multiple strategies:
     1. By label (get_by_label)
     2. By placeholder (get_by_placeholder)
     3. By role + name (get_by_role)
-    4. Fallback: XPath near label
+    4. Direct input[name] attribute
+    5. Direct input[id] attribute
+    6. Partial text match in labels
+    7. XPath near label (fallback)
     """
     normalized = normalize_label(label_text)
     logger.info(f"🔍 RESOLVING LOCATOR for: '{label_text}' → normalized: '{normalized}'")
     
     try:
         # 1. Try by label
-        logger.debug(f"  Strategy 1/4: Trying get_by_label('{normalized}')")
+        logger.debug(f"  Strategy 1/7: Trying get_by_label('{normalized}')")
         locator = page.get_by_label(normalized, exact=False)
         count = await locator.count()
         logger.debug(f"  → Found {count} elements by label")
@@ -134,7 +137,7 @@ async def resolve_locator(page: Page, label_text: str):
     
     try:
         # 2. Try by placeholder
-        logger.debug(f"  Strategy 2/4: Trying get_by_placeholder('{normalized}')")
+        logger.debug(f"  Strategy 2/7: Trying get_by_placeholder('{normalized}')")
         locator = page.get_by_placeholder(normalized, exact=False)
         count = await locator.count()
         logger.debug(f"  → Found {count} elements by placeholder")
@@ -146,7 +149,7 @@ async def resolve_locator(page: Page, label_text: str):
     
     try:
         # 3. Try by role
-        logger.debug(f"  Strategy 3/4: Trying get_by_role('textbox', name='{normalized}')")
+        logger.debug(f"  Strategy 3/7: Trying get_by_role('textbox', name='{normalized}')")
         locator = page.get_by_role("textbox", name=normalized, exact=False)
         count = await locator.count()
         logger.debug(f"  → Found {count} elements by role")
@@ -156,9 +159,45 @@ async def resolve_locator(page: Page, label_text: str):
     except Exception as e:
         logger.debug(f"  → get_by_role failed: {e}")
     
-    # 4. Fallback: XPath near label
     try:
-        logger.debug(f"  Strategy 4/4: Trying XPath fallback")
+        # 4. Try by name attribute (input[name*='...'])
+        logger.debug(f"  Strategy 4/7: Trying input[name*='{normalized}']")
+        locator = page.locator(f"input[name*='{normalized}' i], textarea[name*='{normalized}' i]")
+        count = await locator.count()
+        logger.debug(f"  → Found {count} elements by name attribute")
+        if count > 0:
+            logger.info(f"✅ FOUND BY NAME ATTR: '{normalized}' ({count} matches)")
+            return locator.first
+    except Exception as e:
+        logger.debug(f"  → name attribute search failed: {e}")
+    
+    try:
+        # 5. Try by id attribute (input[id*='...'])
+        logger.debug(f"  Strategy 5/7: Trying input[id*='{normalized}']")
+        locator = page.locator(f"input[id*='{normalized}' i], textarea[id*='{normalized}' i]")
+        count = await locator.count()
+        logger.debug(f"  → Found {count} elements by id attribute")
+        if count > 0:
+            logger.info(f"✅ FOUND BY ID ATTR: '{normalized}' ({count} matches)")
+            return locator.first
+    except Exception as e:
+        logger.debug(f"  → id attribute search failed: {e}")
+    
+    try:
+        # 6. Try to find label containing text and get its associated input
+        logger.debug(f"  Strategy 6/7: Trying label containing '{normalized}'")
+        locator = page.locator(f"label:has-text('{normalized}') + input, label:has-text('{normalized}') + textarea")
+        count = await locator.count()
+        logger.debug(f"  → Found {count} elements via adjacent label")
+        if count > 0:
+            logger.info(f"✅ FOUND BY ADJACENT LABEL: '{normalized}' ({count} matches)")
+            return locator.first
+    except Exception as e:
+        logger.debug(f"  → adjacent label search failed: {e}")
+    
+    # 7. Fallback: XPath near label
+    try:
+        logger.debug(f"  Strategy 7/7: Trying XPath fallback")
         xpath = f'//label[contains(translate(normalize-space(.), "*:", ""), "{normalized}")]/following::*[self::input or self::textarea][1]'
         logger.debug(f"  → XPath: {xpath}")
         locator = page.locator(f"xpath={xpath}")
@@ -171,7 +210,7 @@ async def resolve_locator(page: Page, label_text: str):
         logger.debug(f"  → XPath fallback failed: {e}")
     
     logger.error(f"❌ FAILED ALL STRATEGIES for: '{label_text}'")
-    logger.error(f"   Tried: label, placeholder, role(textbox), XPath - all returned 0 matches")
+    logger.error(f"   Tried: label, placeholder, role(textbox), name attr, id attr, adjacent label, XPath - all returned 0 matches")
     return None
 
 async def fill_field_robust(page: Page, label: str, value: str, logs: List[str]):
@@ -520,6 +559,8 @@ Return ONLY valid JSON in this exact format:
             result = response.json()
             content = result["choices"][0]["message"]["content"]
             
+            logger.info(f"📝 Raw Vision response (first 500 chars): {content[:500]}")
+            
             # Parse JSON from response
             # Remove markdown code blocks if present
             content = content.strip()
@@ -531,7 +572,19 @@ Return ONLY valid JSON in this exact format:
                 content = content[:-3]
             content = content.strip()
             
-            analysis = json.loads(content)
+            if not content:
+                logger.error("❌ Empty content from Vision API")
+                return {"fields": [], "captcha": {"present": False}, "submit_button": {"found": False}}
+            
+            logger.info(f"📝 Cleaned content (first 300 chars): {content[:300]}")
+            
+            try:
+                analysis = json.loads(content)
+            except json.JSONDecodeError as je:
+                logger.error(f"❌ JSON parse error: {je}")
+                logger.error(f"Content that failed to parse: {content[:1000]}")
+                return {"fields": [], "captcha": {"present": False}, "submit_button": {"found": False}}
+            
             logger.info(f"✅ Vision AI found {len(analysis.get('fields', []))} fields")
             
             return analysis
