@@ -256,6 +256,57 @@ async def detect_captcha(page: Page) -> Tuple[bool, str]:
         logger.error(f"Error detecting CAPTCHA: {e}")
         return False, ""
 
+async def wait_for_captcha_resolution(
+    page: Page, 
+    max_wait_seconds: int = 90,
+    logs: Optional[List[str]] = None
+) -> Tuple[bool, float]:
+    """
+    Wait for Bright Data to automatically resolve CAPTCHA.
+    
+    Periodically checks if CAPTCHA has disappeared from the page.
+    Returns (captcha_resolved, wait_time_seconds)
+    """
+    start_time = time.time()
+    check_interval = 5  # Check every 5 seconds
+    
+    if logs:
+        logs.append(f"⏳ Waiting for Bright Data to resolve CAPTCHA (max {max_wait_seconds}s)...")
+    logger.info(f"⏳ Starting CAPTCHA resolution wait (max {max_wait_seconds}s)")
+    
+    while (time.time() - start_time) < max_wait_seconds:
+        try:
+            # Check if CAPTCHA is still present
+            captcha_present, captcha_type = await detect_captcha(page)
+            
+            if not captcha_present:
+                elapsed = time.time() - start_time
+                if logs:
+                    logs.append(f"✅ CAPTCHA resolved by Bright Data in {elapsed:.1f}s!")
+                logger.info(f"✅ CAPTCHA resolved successfully in {elapsed:.1f}s")
+                return True, elapsed
+            
+            # Log progress
+            elapsed = time.time() - start_time
+            if logs and int(elapsed) % 15 == 0:  # Log every 15 seconds
+                logs.append(f"⏰ Still waiting... {elapsed:.0f}s / {max_wait_seconds}s")
+            logger.debug(f"⏰ CAPTCHA still present after {elapsed:.1f}s")
+            
+            # Wait before next check
+            await asyncio.sleep(check_interval)
+            
+        except Exception as e:
+            logger.error(f"Error checking CAPTCHA status: {e}")
+            await asyncio.sleep(check_interval)
+    
+    # Timeout reached
+    elapsed = time.time() - start_time
+    if logs:
+        logs.append(f"⚠️ CAPTCHA still present after {elapsed:.1f}s")
+    logger.warning(f"⚠️ CAPTCHA resolution timeout after {elapsed:.1f}s")
+    
+    return False, elapsed
+
 # ============================================================================
 # PLATFORM ADAPTERS
 # ============================================================================
@@ -714,7 +765,12 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
     filled_fields = []
     telemetry = {
         "bd_browser_api_connected": False,
-        "captcha_detected": False,
+        "captcha_detected_dom": False,
+        "captcha_detected_vision": False,
+        "captcha_wait_initiated": False,
+        "captcha_wait_time_seconds": 0.0,
+        "captcha_resolved_by_brightdata": False,
+        "captcha_resolution_failed": False,
         "platform": "unknown",
         "vision_analysis_used": False,
         "fields_detected_by_vision": 0,
@@ -826,6 +882,31 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
             await page.evaluate("window.scrollTo(0, 500)")
             await asyncio.sleep(random.uniform(1, 2))
             
+            # CAPTCHA CHECK: Before taking screenshot, check if CAPTCHA is present
+            # If Bright Data is enabled, give it time to resolve
+            if request.use_bright_data:
+                logs.append("🔍 Checking for CAPTCHA presence (DOM selectors)...")
+                captcha_detected_dom, captcha_selector = await detect_captcha(page)
+                
+                if captcha_detected_dom:
+                    telemetry["captcha_detected_dom"] = True
+                    telemetry["captcha_wait_initiated"] = True
+                    logs.append(f"🔒 CAPTCHA detected: {captcha_selector}")
+                    logs.append("🔌 Bright Data Browser API active - waiting for automatic resolution...")
+                    
+                    # Wait for Bright Data to resolve CAPTCHA
+                    resolved, wait_time = await wait_for_captcha_resolution(page, max_wait_seconds=90, logs=logs)
+                    telemetry["captcha_wait_time_seconds"] = wait_time
+                    
+                    if resolved:
+                        telemetry["captcha_resolved_by_brightdata"] = True
+                        logs.append("✅ CAPTCHA resolved successfully, continuing with application")
+                    else:
+                        telemetry["captcha_resolution_failed"] = True
+                        logs.append("⚠️ CAPTCHA persists, but continuing to Vision analysis...")
+                else:
+                    logs.append("✅ No CAPTCHA detected via DOM selectors")
+            
             # STEP 1: Take pre-screenshot and analyze with Vision AI
             screenshot_pre = await take_screenshot(page, "pre")
             logs.append("📸 Initial screenshot captured")
@@ -846,10 +927,46 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
                 # Check for CAPTCHA
                 if form_analysis.get("captcha", {}).get("present"):
                     captcha_type = form_analysis["captcha"].get("type", "unknown")
-                    telemetry["captcha_detected"] = True
-                    logs.append(f"🔒 CAPTCHA detected by Vision: {captcha_type}")
+                    telemetry["captcha_detected_vision"] = True
+                    logs.append(f"🤖 Vision AI detected CAPTCHA: {captcha_type}")
                     
-                    if not request.auto_captcha_allowed:
+                    if request.use_bright_data:
+                        # Bright Data should have already handled it
+                        logs.append(f"⚠️ Vision still sees CAPTCHA ({captcha_type}) after Bright Data wait")
+                        logs.append("🔄 Attempting second resolution cycle (30s)...")
+                        
+                        # Second attempt with shorter timeout
+                        resolved, additional_wait = await wait_for_captcha_resolution(page, max_wait_seconds=30, logs=logs)
+                        telemetry["captcha_wait_time_seconds"] += additional_wait
+                        
+                        if resolved:
+                            telemetry["captcha_resolved_by_brightdata"] = True
+                            logs.append(f"✅ CAPTCHA resolved in second cycle (total: {telemetry['captcha_wait_time_seconds']:.1f}s)")
+                            
+                            # Take new screenshot to verify
+                            screenshot_pre = await take_screenshot(page, "post_captcha")
+                            screenshot_b64 = screenshot_pre.split(",")[1] if "," in screenshot_pre else screenshot_pre
+                            
+                            # Re-analyze with Vision
+                            form_analysis = await analyze_form_with_vision(screenshot_b64, openai_key)
+                            logs.append("🤖 Re-analyzing form after CAPTCHA resolution...")
+                        else:
+                            telemetry["captcha_resolution_failed"] = True
+                            logs.append(f"❌ CAPTCHA persists after {telemetry['captcha_wait_time_seconds']:.1f}s total")
+                            
+                            if not request.auto_captcha_allowed:
+                                return AutoApplyResponse(
+                                    status="needs_review",
+                                    run_id=run_id,
+                                    message=f"CAPTCHA ({captcha_type}) could not be resolved automatically",
+                                    screenshot_pre=screenshot_pre,
+                                    logs=logs,
+                                    errors=[f"CAPTCHA resolution failed: {captcha_type}"],
+                                    telemetry=telemetry
+                                )
+                            else:
+                                logs.append("⚠️ Proceeding despite CAPTCHA (auto_captcha_allowed=true)...")
+                    elif not request.auto_captcha_allowed:
                         return AutoApplyResponse(
                             status="needs_review",
                             run_id=run_id,
@@ -912,13 +1029,38 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
                 telemetry["platform"] = platform
                 logs.append(f"🔍 Platform detected: {platform}")
                 
-                # Check for CAPTCHA with old method
-                captcha_detected, captcha_type = await detect_captcha(page)
+                # Check for CAPTCHA with fallback method
+                captcha_detected, captcha_selector = await detect_captcha(page)
                 if captcha_detected:
-                    telemetry["captcha_detected"] = True
-                    logs.append(f"🔒 CAPTCHA detected: {captcha_type}")
+                    telemetry["captcha_detected_dom"] = True
+                    logs.append(f"🔒 CAPTCHA detected (fallback): {captcha_selector}")
                     
-                    if not request.auto_captcha_allowed:
+                    if request.use_bright_data:
+                        # Give Bright Data a chance to resolve
+                        telemetry["captcha_wait_initiated"] = True
+                        logs.append("🔌 Bright Data active - waiting for CAPTCHA resolution...")
+                        
+                        resolved, wait_time = await wait_for_captcha_resolution(page, max_wait_seconds=60, logs=logs)
+                        telemetry["captcha_wait_time_seconds"] = wait_time
+                        
+                        if resolved:
+                            telemetry["captcha_resolved_by_brightdata"] = True
+                            logs.append("✅ CAPTCHA resolved, continuing with adapter...")
+                        else:
+                            telemetry["captcha_resolution_failed"] = True
+                            logs.append("⚠️ CAPTCHA resolution failed")
+                            
+                            if not request.auto_captcha_allowed:
+                                return AutoApplyResponse(
+                                    status="needs_review",
+                                    run_id=run_id,
+                                    message="CAPTCHA could not be resolved automatically",
+                                    screenshot_pre=screenshot_pre,
+                                    logs=logs,
+                                    errors=["CAPTCHA resolution failed"],
+                                    telemetry=telemetry
+                                )
+                    elif not request.auto_captcha_allowed:
                         return AutoApplyResponse(
                             status="needs_review",
                             run_id=run_id,
