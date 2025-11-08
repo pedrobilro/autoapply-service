@@ -3,12 +3,12 @@ FROM mcr.microsoft.com/playwright/python:v1.46.0
 
 WORKDIR /app
 
-# Dependências Python
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# Dependências Python (copiadas a partir do monorepo)
+COPY python-service/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copia o código
-COPY . /app
+# Copia apenas o serviço Python
+COPY python-service/ /app
 
 # Ambiente
 ENV PYTHONUNBUFFERED=1
