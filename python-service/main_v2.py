@@ -450,31 +450,51 @@ async def analyze_screenshot_with_vision(
                     "messages": [
                         {
                             "role": "system",
-                            "content": """You are an AI that analyzes job application screenshots. Return STRICT JSON (no markdown).
+                            "content": """You are a Playwright automation expert analyzing job application screenshots. Return STRICT JSON (no markdown).
 
 FORMAT:
 {
   "success": true/false,
   "reason": "explanation",
   "instructions": [
-    {"action": "fill", "selector": "Field Label Text", "value": "derived from CV"},
-    {"action": "select", "selector": "Dropdown Label", "value": "Yes/No"}
+    {
+      "action": "fill",
+      "css_selector": "input[name='email']",
+      "field_label": "Email Address",
+      "value": "candidate@example.com"
+    }
   ],
   "captcha_type": "iframe" (if present)
 }
 
-RULES:
-- Use EXACT label text visible on form for "selector"
-- Derive values from CV when fields empty
-- actions: fill, select, check, click"""
+CRITICAL RULES FOR CSS SELECTORS:
+1. Look at EVERY input field in the screenshot
+2. For EACH empty or incorrect field, extract the EXACT CSS selector from HTML attributes:
+   - Priority 1: input[name='exact-name-attribute']
+   - Priority 2: input[id='exact-id-attribute']
+   - Priority 3: input[type='email'] or input[type='tel']
+   - Priority 4: input[aria-label='exact-aria-label']
+   - Priority 5: input[placeholder='exact-placeholder']
+
+3. Actions: "fill" (text inputs), "select" (dropdowns), "check" (checkboxes), "click" (buttons)
+4. For "field_label", use the EXACT visible label text
+5. For "value", use data from CV or known_fields
+
+EXAMPLE:
+If you see an input with name="applicant_email" that's empty:
+{"action": "fill", "css_selector": "input[name='applicant_email']", "field_label": "Email", "value": "from_cv"}"""
                         },
                         {
                             "role": "user",
                             "content": [
                                 {"type": "text", "text": (
-                                    "Analyze this job application screenshot. Decide if submission succeeded. "
-                                    "If not, list missing/incorrect fields with exact labels and values from CV. "
-                                    "Known fields: " + str(known_fields) + "\n\nCV excerpt:\n" + (cv_excerpt or "")
+                                    "Analyze this job application form screenshot. "
+                                    "1. Check if submission was successful (look for success messages, confirmation pages)\n"
+                                    "2. If NOT successful, find ALL empty or incorrect input fields\n"
+                                    "3. For each field, extract the EXACT CSS selector from HTML attributes visible in the screenshot\n"
+                                    "4. Provide Playwright instructions with specific CSS selectors\n\n"
+                                    "Known candidate data: " + str(known_fields) + "\n\n"
+                                    "CV excerpt:\n" + (cv_excerpt or "")
                                 )},
                                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}}
                             ]
@@ -545,94 +565,84 @@ RULES:
 
 async def execute_vision_instructions(page: Page, instructions: List[Dict], logs: List[str]) -> int:
     """
-    Executa as instruções fornecidas pelo Vision AI com retry logic.
+    Executa instruções Playwright diretas do Vision AI com CSS selectors específicos.
     Retorna número de instruções executadas com sucesso.
     """
     if not instructions:
         return 0
     
-    logger.info(f"🔧 Executando {len(instructions)} instruções do Vision...")
-    logs.append(f"🔧 Aplicando {len(instructions)} correções...")
+    logger.info(f"🔧 Executando {len(instructions)} instruções Playwright do Vision...")
+    logs.append(f"🔧 Aplicando {len(instructions)} correções com CSS selectors...")
     executed = 0
     
     for idx, inst in enumerate(instructions, 1):
         try:
             action = inst.get("action", "fill")
-            selector = inst.get("selector", "")
+            css_selector = inst.get("css_selector", "")
+            field_label = inst.get("field_label", "unknown")
             value = inst.get("value", "")
             
-            if not selector or not value:
-                logger.warning(f"  ⚠️ {idx}. Instrução inválida (sem selector/value)")
+            if not css_selector or not value:
+                logger.warning(f"  ⚠️ {idx}. Instrução inválida: falta css_selector ou value")
+                logs.append(f"⚠️ Instrução #{idx} inválida (falta selector/value)")
                 continue
             
-            logger.info(f"  📝 {idx}/{len(instructions)}: {action} '{selector}' = '{value}'")
+            logger.info(f"  📝 {idx}/{len(instructions)}: {action} '{field_label}' usando {css_selector}")
             
-            if action == "fill":
-                # Primeiro tentar com CSS fallback (mais robusto)
-                success = await fill_field_with_css_fallback(page, selector, value, logs)
+            try:
+                # Executar comando Playwright DIRETO com o CSS selector fornecido pelo Vision AI
+                loc = page.locator(css_selector).first
                 
-                # Se falhar, tentar interpretar selector como label
-                if not success:
-                    logger.debug(f"    → Retry: interpreting '{selector}' as label text")
-                    success = await fill_field_robust(page, selector, value, logs)
+                # Esperar que o elemento esteja disponível
+                await loc.wait_for(state="attached", timeout=3000)
                 
-                if success:
-                    executed += 1
-                    logger.info(f"    ✅ Instrução {idx} executada")
+                if await loc.is_visible():
+                    if action == "fill":
+                        await loc.click()
+                        await asyncio.sleep(0.1)
+                        await loc.clear()
+                        await asyncio.sleep(0.1)
+                        await loc.fill(value)
+                        await asyncio.sleep(0.2)
+                        logs.append(f"✅ Preenchido '{field_label}' = '{value}'")
+                        logger.info(f"    ✅ SUCCESS: filled '{field_label}'")
+                        executed += 1
+                        
+                    elif action == "select":
+                        await loc.select_option(label=value)
+                        logs.append(f"✅ Selecionado '{value}' em '{field_label}'")
+                        logger.info(f"    ✅ SUCCESS: selected '{value}'")
+                        executed += 1
+                        
+                    elif action == "check":
+                        if not await loc.is_checked():
+                            await loc.check()
+                        logs.append(f"✅ Marcado '{field_label}'")
+                        logger.info(f"    ✅ SUCCESS: checked '{field_label}'")
+                        executed += 1
+                        
+                    elif action == "click":
+                        await loc.click()
+                        logs.append(f"✅ Clicado '{field_label}'")
+                        logger.info(f"    ✅ SUCCESS: clicked '{field_label}'")
+                        executed += 1
                 else:
-                    logger.warning(f"    ⚠️ Instrução {idx} falhou")
-            elif action == "select" and selector and value:
-                # Try to select from dropdown
-                try:
-                    locator = await resolve_locator(page, selector)
-                    if locator:
-                        await locator.select_option(label=value)
-                        logs.append(f"✅ Selected '{value}' in '{selector}'")
-                        logger.info(f"    ✅ Selected '{value}'")
-                        executed += 1
-                    else:
-                        logger.warning(f"    ⚠️ Locator not found for select: '{selector}'")
-                except Exception as e:
-                    logger.error(f"    ❌ Failed to select: {e}")
-            
-            elif action == "check" and selector:
-                # Try to check checkbox
-                try:
-                    locator = await resolve_locator(page, selector)
-                    if locator:
-                        await locator.check()
-                        logs.append(f"✅ Checked '{selector}'")
-                        logger.info(f"    ✅ Checked checkbox")
-                        executed += 1
-                    else:
-                        logger.warning(f"    ⚠️ Locator not found for check: '{selector}'")
-                except Exception as e:
-                    logger.error(f"    ❌ Failed to check: {e}")
-            
-            elif action == "click" and selector:
-                # Try to click element
-                try:
-                    locator = await resolve_locator(page, selector)
-                    if locator:
-                        await locator.click()
-                        logs.append(f"✅ Clicked '{selector}'")
-                        logger.info(f"    ✅ Clicked element")
-                        executed += 1
-                        await asyncio.sleep(0.5)
-                    else:
-                        logger.warning(f"    ⚠️ Locator not found for click: '{selector}'")
-                except Exception as e:
-                    logger.error(f"    ❌ Failed to click: {e}")
-            
-            else:
-                logger.warning(f"    ⚠️ Unknown action: '{action}'")
-        
+                    logger.warning(f"    ⚠️ Elemento não visível: {css_selector}")
+                    logs.append(f"⚠️ #{idx} Elemento não visível: {field_label}")
+                    
+            except TimeoutError:
+                logger.error(f"    ❌ Timeout esperando por: {css_selector}")
+                logs.append(f"❌ #{idx} Timeout: {field_label}")
+            except Exception as e:
+                logger.error(f"    ❌ Erro ao executar: {str(e)[:100]}")
+                logs.append(f"❌ #{idx} Erro: {field_label} - {str(e)[:50]}")
+                
         except Exception as e:
-            logger.error(f"❌ Error executing instruction {idx}: {e}")
+            logger.error(f"❌ Erro executando instrução {idx}: {e}")
             logger.error(traceback.format_exc())
     
-    logger.info(f"✅ Executadas {executed}/{len(instructions)} instruções")
-    logs.append(f"✅ Aplicadas {executed}/{len(instructions)} correções")
+    logger.info(f"✅ Executadas {executed}/{len(instructions)} instruções Playwright")
+    logs.append(f"✅ Aplicadas {executed}/{len(instructions)} correções Vision AI")
     return executed
 
 
