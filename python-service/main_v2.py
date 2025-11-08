@@ -273,6 +273,196 @@ def get_bright_data_browser_api_endpoint(username: str, password: str) -> Option
     # Format: wss://username:password@brd.superproxy.io:9222
     return f"wss://{username}:{password}@brd.superproxy.io:9222"
 
+async def analyze_screenshot_with_vision(
+    screenshot_b64: str, 
+    logs: List[str], 
+    openai_key: Optional[str] = None, 
+    cv_text: Optional[str] = None, 
+    user_data: Optional[Dict[str, str]] = None
+) -> Dict:
+    """
+    Analisa screenshot com GPT Vision para verificar:
+    - success: True/False (se candidatura foi bem-sucedida)
+    - reason: explicação
+    - instructions: lista de ações para corrigir (se não foi sucesso)
+    - captcha_type: tipo de CAPTCHA (se detectado)
+    """
+    if not openai_key:
+        logger.warning("⚠ OPENAI_API_KEY não fornecida - pulando Vision")
+        logs.append("⚠ Vision AI não disponível (API key em falta)")
+        return {"success": False, "reason": "API key not provided", "instructions": []}
+    
+    try:
+        logger.info("🔍 Analisando screenshot com GPT-4 Vision...")
+        logs.append("🔍 Analisando página com Vision AI...")
+        
+        # Compactar CV text
+        cv_excerpt = None
+        if cv_text:
+            cv_excerpt = cv_text.strip()[:4000]
+        
+        known_fields = {k: v for k, v in (user_data or {}).items() if k in [
+            "full_name","email","phone","location","current_company","linkedin_url","years_of_experience"
+        ] and v}
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o",
+                    "temperature": 0.3,
+                    "max_tokens": 800,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": """You are an AI that analyzes job application screenshots. Return STRICT JSON (no markdown).
+
+FORMAT:
+{
+  "success": true/false,
+  "reason": "explanation",
+  "instructions": [
+    {"action": "fill", "selector": "Field Label Text", "value": "derived from CV"},
+    {"action": "select", "selector": "Dropdown Label", "value": "Yes/No"}
+  ],
+  "captcha_type": "iframe" (if present)
+}
+
+RULES:
+- Use EXACT label text visible on form for "selector"
+- Derive values from CV when fields empty
+- actions: fill, select, check, click"""
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": (
+                                    "Analyze this job application screenshot. Decide if submission succeeded. "
+                                    "If not, list missing/incorrect fields with exact labels and values from CV. "
+                                    "Known fields: " + str(known_fields) + "\n\nCV excerpt:\n" + (cv_excerpt or "")
+                                )},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}}
+                            ]
+                        }
+                    ]
+                }
+            )
+            
+            if response.status_code != 200:
+                error_text = response.text
+                logger.error(f"Vision API error: {response.status_code} - {error_text[:200]}")
+                logs.append(f"❌ Vision API error: {response.status_code}")
+                return {"success": False, "reason": "API error", "instructions": []}
+            
+            data = response.json()
+            logger.info("📥 Vision API response OK")
+            
+            if "choices" not in data or not data["choices"]:
+                logger.error(f"Invalid Vision response: {str(data)[:200]}")
+                logs.append("❌ Resposta inválida do Vision AI")
+                return {"success": False, "reason": "Invalid API response", "instructions": []}
+            
+            content = data["choices"][0]["message"]["content"]
+            logger.debug(f"Vision content: {content[:100]}...")
+            
+            # Limpar markdown
+            content_clean = content.strip()
+            if content_clean.startswith("```json"):
+                content_clean = content_clean[7:]
+            if content_clean.startswith("```"):
+                content_clean = content_clean[3:]
+            if content_clean.endswith("```"):
+                content_clean = content_clean[:-3]
+            content_clean = content_clean.strip()
+            
+            # Parse JSON
+            try:
+                result = json.loads(content_clean)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}, trying regex fallback...")
+                json_match = re.search(r'\{[\s\S]*\}', content_clean)
+                if json_match:
+                    result = json.loads(json_match.group(0))
+                else:
+                    logger.error("Failed to extract JSON from Vision response")
+                    logs.append("❌ Não foi possível interpretar resposta do Vision AI")
+                    return {"success": False, "reason": "Failed to parse", "instructions": []}
+            
+            if result.get("success"):
+                logger.info(f"✅ Vision confirmou sucesso: {result.get('reason', '')}")
+                logs.append(f"✅ Vision AI: {result.get('reason', 'Candidatura bem-sucedida')}")
+            else:
+                logger.warning(f"⚠️ Vision detectou problemas: {result.get('reason', '')}")
+                logs.append(f"⚠️ Vision AI: {result.get('reason', 'Campos em falta ou erros')}")
+                instructions = result.get("instructions", [])
+                if instructions:
+                    logger.info(f"📋 {len(instructions)} instruções recebidas")
+                    logs.append(f"📋 {len(instructions)} correções sugeridas")
+            
+            return result
+            
+    except Exception as e:
+        logger.error(f"Vision analysis error: {e}")
+        logger.error(traceback.format_exc())
+        logs.append(f"❌ Erro Vision AI: {str(e)}")
+        return {"success": False, "reason": str(e), "instructions": []}
+
+
+async def execute_vision_instructions(page: Page, instructions: List[Dict], logs: List[str]) -> int:
+    """
+    Executa as instruções fornecidas pelo Vision AI.
+    Retorna número de instruções executadas com sucesso.
+    """
+    if not instructions:
+        return 0
+    
+    logger.info(f"🔧 Executando {len(instructions)} instruções do Vision...")
+    logs.append(f"🔧 Aplicando {len(instructions)} correções...")
+    executed = 0
+    
+    for idx, inst in enumerate(instructions, 1):
+        try:
+            action = inst.get("action", "fill")
+            selector = inst.get("selector", "")
+            value = inst.get("value", "")
+            
+            logger.debug(f"  {idx}. {action} '{selector}' = '{value}'")
+            
+            if action == "fill" and selector and value:
+                if await fill_field_robust(page, selector, value, logs):
+                    executed += 1
+            elif action == "select" and selector and value:
+                # Try to select from dropdown
+                try:
+                    locator = await resolve_locator(page, selector)
+                    if locator:
+                        await locator.select_option(label=value)
+                        logs.append(f"✅ Selected '{value}' in '{selector}'")
+                        executed += 1
+                except Exception as e:
+                    logger.error(f"Failed to select: {e}")
+            elif action == "check" and selector:
+                # Try to check checkbox
+                try:
+                    locator = await resolve_locator(page, selector)
+                    if locator:
+                        await locator.check()
+                        logs.append(f"✅ Checked '{selector}'")
+                        executed += 1
+                except Exception as e:
+                    logger.error(f"Failed to check: {e}")
+        except Exception as e:
+            logger.error(f"Error executing instruction {idx}: {e}")
+    
+    logger.info(f"✅ Executadas {executed}/{len(instructions)} instruções")
+    logs.append(f"✅ Aplicadas {executed}/{len(instructions)} correções")
+    return executed
+
+
 async def detect_captcha(page: Page) -> Tuple[bool, str]:
     """Detect CAPTCHA on page."""
     try:
@@ -966,191 +1156,103 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
                 else:
                     logs.append("✅ No CAPTCHA detected via DOM selectors")
             
-            # STEP 1: Take pre-screenshot and analyze with Vision AI
+            # STEP 1: Take pre-screenshot
             screenshot_pre = await take_screenshot(page, "pre")
             logs.append("📸 Initial screenshot captured")
-            logger.info("📸 Screenshot captured, starting Vision analysis...")
             
             # Extract base64 from screenshot
             screenshot_b64 = screenshot_pre.split(",")[1] if "," in screenshot_pre else screenshot_pre
             
-            # STEP 2: Vision AI Analysis
-            if not openai_key:
-                logs.append("⚠️ No OpenAI API key - skipping Vision AI analysis")
-                logger.warning("No OpenAI API key available - will use platform adapters")
-                form_analysis = None
-            else:
-                logs.append("🤖 Starting Vision AI analysis...")
-                form_analysis = await analyze_form_with_vision(screenshot_b64, openai_key)
-                if form_analysis:
-                    logs.append(f"✅ Vision AI analysis complete: {form_analysis.keys()}")
-                else:
-                    logs.append("❌ Vision AI analysis returned None")
+            # STEP 2: Detect platform and fill fields with adapters FIRST
+            platform = await detect_platform(page, request.job_url)
+            telemetry["platform"] = platform
+            logs.append(f"🔍 Platform detected: {platform}")
             
-            if form_analysis and form_analysis.get("fields"):
-                telemetry["vision_analysis_used"] = True
-                telemetry["fields_detected_by_vision"] = len(form_analysis["fields"])
-                logs.append(f"🤖 Vision AI detected {len(form_analysis['fields'])} fields")
-                logger.info(f"🤖 Vision detected {len(form_analysis['fields'])} fields")
-                
-                # Check for CAPTCHA
-                if form_analysis.get("captcha", {}).get("present"):
-                    captcha_type = form_analysis["captcha"].get("type", "unknown")
-                    telemetry["captcha_detected_vision"] = True
-                    logs.append(f"🤖 Vision AI detected CAPTCHA: {captcha_type}")
-                    
-                    if request.use_bright_data:
-                        # Bright Data should have already handled it
-                        logs.append(f"⚠️ Vision still sees CAPTCHA ({captcha_type}) after Bright Data wait")
-                        logs.append("🔄 Attempting second resolution cycle (30s)...")
-                        
-                        # Second attempt with shorter timeout
-                        resolved, additional_wait = await wait_for_captcha_resolution(page, max_wait_seconds=30, logs=logs)
-                        telemetry["captcha_wait_time_seconds"] += additional_wait
-                        
-                        if resolved:
-                            telemetry["captcha_resolved_by_brightdata"] = True
-                            logs.append(f"✅ CAPTCHA resolved in second cycle (total: {telemetry['captcha_wait_time_seconds']:.1f}s)")
-                            
-                            # Take new screenshot to verify
-                            screenshot_pre = await take_screenshot(page, "post_captcha")
-                            screenshot_b64 = screenshot_pre.split(",")[1] if "," in screenshot_pre else screenshot_pre
-                            
-                            # Re-analyze with Vision
-                            form_analysis = await analyze_form_with_vision(screenshot_b64, openai_key)
-                            logs.append("🤖 Re-analyzing form after CAPTCHA resolution...")
-                        else:
-                            telemetry["captcha_resolution_failed"] = True
-                            logs.append(f"❌ CAPTCHA persists after {telemetry['captcha_wait_time_seconds']:.1f}s total")
-                            
-                            if not request.auto_captcha_allowed:
-                                return AutoApplyResponse(
-                                    status="needs_review",
-                                    run_id=run_id,
-                                    message=f"CAPTCHA ({captcha_type}) could not be resolved automatically",
-                                    screenshot_pre=screenshot_pre,
-                                    logs=logs,
-                                    errors=[f"CAPTCHA resolution failed: {captcha_type}"],
-                                    telemetry=telemetry
-                                )
-                            else:
-                                logs.append("⚠️ Proceeding despite CAPTCHA (auto_captcha_allowed=true)...")
-                    elif not request.auto_captcha_allowed:
-                        return AutoApplyResponse(
-                            status="needs_review",
-                            run_id=run_id,
-                            message=f"CAPTCHA detected ({captcha_type}) - manual intervention required",
-                            screenshot_pre=screenshot_pre,
-                            logs=logs,
-                            errors=[f"CAPTCHA: {captcha_type}"],
-                            telemetry=telemetry
-                        )
-                    else:
-                        logs.append("⏳ Attempting to proceed with CAPTCHA...")
-                        await asyncio.sleep(3)
-                
-                # STEP 3: Fill fields based on Vision analysis
-                logs.append("📝 Starting to fill fields based on Vision analysis...")
-                
-                for field_info in form_analysis["fields"]:
-                    field_label = field_info.get("label", "unknown")
-                    field_type = field_info.get("type", "text")
-                    selector_hints = field_info.get("selector_hints", [field_label])
-                    
-                    # Determine what value to use
-                    value = None
-                    field_name = field_label.lower()
-                    
-                    # Match field to data
-                    if any(hint in field_name for hint in ["name", "nome", "full name"]):
-                        value = request.full_name
-                    elif any(hint in field_name for hint in ["email", "e-mail"]):
-                        value = request.email
-                    elif any(hint in field_name for hint in ["phone", "telefone", "tel", "mobile"]):
-                        value = request.phone
-                    elif any(hint in field_name for hint in ["location", "city", "localização", "address"]):
-                        value = request.location or request.current_company
-                    elif any(hint in field_name for hint in ["company", "empresa", "current company"]):
-                        value = request.current_company
-                    elif any(hint in field_name for hint in ["linkedin"]):
-                        value = request.linkedin_url
-                    elif any(hint in field_name for hint in ["experience", "years"]):
-                        value = request.years_of_experience
-                    
-                    if value:
-                        # Try each selector hint
-                        filled = False
-                        for hint in selector_hints:
-                            if await fill_field_robust(page, hint, value, logs):
-                                filled_fields.append(field_label)
-                                filled = True
-                                break
-                        
-                        if not filled:
-                            logs.append(f"⚠️ Could not fill '{field_label}' - tried: {', '.join(selector_hints)}")
-                    else:
-                        logs.append(f"⚠️ No data available for field: '{field_label}'")
-                
+            # Use platform adapters to fill fields
+            adapter_result = {}
+            if platform == "greenhouse":
+                adapter_result = await greenhouse_adapter(page, request, logs)
+            elif platform == "lever":
+                adapter_result = await lever_adapter(page, request, logs)
             else:
-                # Fallback to platform adapters if Vision fails
-                logs.append("⚠️ Vision analysis failed, using fallback selector engine")
-                platform = await detect_platform(page, request.job_url)
-                telemetry["platform"] = platform
-                logs.append(f"🔍 Platform detected: {platform}")
+                adapter_result = await generic_adapter(page, request, logs)
+            
+            filled_fields = adapter_result.get("filled_fields", [])
+            errors.extend(adapter_result.get("errors", []))
+            
+            logs.append(f"✅ Filled {len(filled_fields)} fields with adapter: {', '.join(filled_fields)}")
+            
+            # STEP 3: Vision AI validation (self-healing loop)
+            if openai_key:
+                MAX_RETRIES = 3
+                retry_count = 0
                 
-                # Check for CAPTCHA with fallback method
-                captcha_detected, captcha_selector = await detect_captcha(page)
-                if captcha_detected:
-                    telemetry["captcha_detected_dom"] = True
-                    logs.append(f"🔒 CAPTCHA detected (fallback): {captcha_selector}")
+                while retry_count < MAX_RETRIES:
+                    retry_count += 1
+                    logs.append(f"🔄 Vision validation attempt {retry_count}/{MAX_RETRIES}")
                     
-                    if request.use_bright_data:
-                        # Give Bright Data a chance to resolve
-                        telemetry["captcha_wait_initiated"] = True
-                        logs.append("🔌 Bright Data active - waiting for CAPTCHA resolution...")
+                    # Scroll to ensure all fields are visible
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(0.5)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await asyncio.sleep(0.5)
+                    
+                    # Take screenshot for validation
+                    validation_screenshot = await take_screenshot(page, f"validation_{retry_count}")
+                    validation_b64 = validation_screenshot.split(",")[1] if "," in validation_screenshot else validation_screenshot
+                    
+                    # Get CV text for Vision context (if resume provided)
+                    cv_text = None
+                    if request.resume:
+                        # Extract text from resume if available
+                        # For now, we'll pass None - can be enhanced later
+                        pass
+                    
+                    # Build user data dict for Vision context
+                    user_data = {
+                        "full_name": request.full_name,
+                        "email": request.email,
+                        "phone": request.phone,
+                        "location": request.location,
+                        "current_company": request.current_company,
+                        "linkedin_url": request.linkedin_url,
+                        "years_of_experience": request.years_of_experience,
+                    }
+                    
+                    # Analyze with Vision AI
+                    vision_result = await analyze_screenshot_with_vision(
+                        validation_b64, logs, openai_key, cv_text, user_data
+                    )
+                    
+                    telemetry[f"vision_validation_attempt_{retry_count}"] = vision_result.get("success", False)
+                    
+                    if vision_result.get("success"):
+                        logs.append(f"✅ Vision AI confirmed form is complete!")
+                        telemetry["vision_validation_success"] = True
+                        break
+                    else:
+                        logs.append(f"⚠️ Vision detected issues: {vision_result.get('reason', 'Unknown')}")
                         
-                        resolved, wait_time = await wait_for_captcha_resolution(page, max_wait_seconds=60, logs=logs)
-                        telemetry["captcha_wait_time_seconds"] = wait_time
-                        
-                        if resolved:
-                            telemetry["captcha_resolved_by_brightdata"] = True
-                            logs.append("✅ CAPTCHA resolved, continuing with adapter...")
-                        else:
-                            telemetry["captcha_resolution_failed"] = True
-                            logs.append("⚠️ CAPTCHA resolution failed")
+                        # Execute Vision instructions to fix issues
+                        instructions = vision_result.get("instructions", [])
+                        if instructions:
+                            executed_count = await execute_vision_instructions(page, instructions, logs)
+                            telemetry[f"vision_corrections_attempt_{retry_count}"] = executed_count
                             
-                            if not request.auto_captcha_allowed:
-                                return AutoApplyResponse(
-                                    status="needs_review",
-                                    run_id=run_id,
-                                    message="CAPTCHA could not be resolved automatically",
-                                    screenshot_pre=screenshot_pre,
-                                    logs=logs,
-                                    errors=["CAPTCHA resolution failed"],
-                                    telemetry=telemetry
-                                )
-                    elif not request.auto_captcha_allowed:
-                        return AutoApplyResponse(
-                            status="needs_review",
-                            run_id=run_id,
-                            message="CAPTCHA detected - manual intervention required",
-                            screenshot_pre=screenshot_pre,
-                            logs=logs,
-                            errors=["CAPTCHA detected"],
-                            telemetry=telemetry
-                        )
+                            if executed_count > 0:
+                                logs.append(f"✅ Applied {executed_count} corrections")
+                                await asyncio.sleep(1)
+                            else:
+                                logs.append("⚠️ No corrections could be applied")
+                                break
+                        else:
+                            logs.append("⚠️ No correction instructions from Vision")
+                            break
                 
-                # Use platform adapters
-                adapter_result = {}
-                if platform == "greenhouse":
-                    adapter_result = await greenhouse_adapter(page, request, logs)
-                elif platform == "lever":
-                    adapter_result = await lever_adapter(page, request, logs)
-                else:
-                    adapter_result = await generic_adapter(page, request, logs)
-                
-                filled_fields = adapter_result.get("filled_fields", [])
-                errors.extend(adapter_result.get("errors", []))
+                if retry_count >= MAX_RETRIES and not vision_result.get("success"):
+                    logs.append(f"⚠️ Max validation retries reached, proceeding anyway")
+            else:
+                logs.append("⚠️ No OpenAI API key - skipping Vision validation")
             
             logs.append(f"✅ Filled {len(filled_fields)} fields: {', '.join(filled_fields)}")
             
@@ -1216,16 +1318,51 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
             screenshot_post = await take_screenshot(page, "post")
             logs.append("📸 Post-screenshot captured")
             
-            # STEP 7: Verify submission with Vision
+            # STEP 7: Verify submission with Vision AI
             post_screenshot_b64 = screenshot_post.split(",")[1] if "," in screenshot_post else screenshot_post
             
+            # Detect basic success with heuristics
+            basic_success, basic_msg = await verify_submission(page)
+            logs.append(f"🔍 Basic verification: {basic_msg}")
+            
+            # Use Vision AI for final confirmation
             if openai_key:
-                verified, verify_msg = await verify_submission_with_vision(post_screenshot_b64, openai_key)
-                logs.append(f"🤖 Vision verification: {verify_msg}")
-            else:
-                # Fallback to old verification
-                verified, verify_msg = await verify_submission(page)
+                # Get CV text and user data for context
+                cv_text = None
+                user_data = {
+                    "full_name": request.full_name,
+                    "email": request.email,
+                    "phone": request.phone,
+                    "location": request.location,
+                    "current_company": request.current_company,
+                    "linkedin_url": request.linkedin_url,
+                    "years_of_experience": request.years_of_experience,
+                }
+                
+                # Analyze with Vision
+                vision_result = await analyze_screenshot_with_vision(
+                    post_screenshot_b64, logs, openai_key, cv_text, user_data
+                )
+                
+                # Success if either Vision confirms OR basic heuristics confirm
+                vision_success = vision_result.get("success", False)
+                verified = vision_success or basic_success
+                
+                if vision_success:
+                    verify_msg = f"✅ Vision AI confirmed: {vision_result.get('reason', 'Application submitted')}"
+                elif basic_success:
+                    verify_msg = f"✅ Heuristics confirmed: {basic_msg}"
+                else:
+                    verify_msg = f"⚠️ Could not confirm submission: {vision_result.get('reason', 'Unknown')}"
+                
                 logs.append(verify_msg)
+                telemetry["vision_verified"] = vision_success
+                telemetry["heuristic_verified"] = basic_success
+            else:
+                # Fallback to basic verification only
+                verified = basic_success
+                verify_msg = basic_msg
+                logs.append(f"⚠️ No Vision AI - using basic verification only")
             
             telemetry["end_time"] = datetime.utcnow().isoformat()
             
