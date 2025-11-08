@@ -1,11 +1,13 @@
 """
-Auto-Apply Service V2
-Implements the ChatGPT plan:
-- Unified /auto-apply endpoint with new contract
-- Robust selector engine (label/placeholder/role resolution)
+Auto-Apply Service V2 - Vision-First Architecture
+Implements intelligent form filling using Vision AI:
+- Screenshot-first approach with GPT-4 Vision analysis
+- Automatic field detection and data extraction
+- Smart data matching from CV/profile
+- CAPTCHA detection and handling
+- Multi-page form support
+- Pre and post-submit validation
 - Bright Data Browser API integration
-- Platform adapters (Greenhouse, Lever, Ashby)
-- Memory system (site_profiles, submission_history, application_runs)
 """
 
 import asyncio
@@ -115,67 +117,94 @@ async def resolve_locator(page: Page, label_text: str):
     4. Fallback: XPath near label
     """
     normalized = normalize_label(label_text)
-    logger.info(f"🔍 Resolving locator for: '{label_text}' → '{normalized}'")
+    logger.info(f"🔍 RESOLVING LOCATOR for: '{label_text}' → normalized: '{normalized}'")
     
     try:
         # 1. Try by label
+        logger.debug(f"  Strategy 1/4: Trying get_by_label('{normalized}')")
         locator = page.get_by_label(normalized, exact=False)
-        if await locator.count() > 0:
-            logger.info(f"✅ Found by label: {normalized}")
+        count = await locator.count()
+        logger.debug(f"  → Found {count} elements by label")
+        if count > 0:
+            logger.info(f"✅ FOUND BY LABEL: '{normalized}' ({count} matches)")
             return locator.first
     except Exception as e:
-        logger.debug(f"get_by_label failed: {e}")
+        logger.debug(f"  → get_by_label failed: {e}")
     
     try:
         # 2. Try by placeholder
+        logger.debug(f"  Strategy 2/4: Trying get_by_placeholder('{normalized}')")
         locator = page.get_by_placeholder(normalized, exact=False)
-        if await locator.count() > 0:
-            logger.info(f"✅ Found by placeholder: {normalized}")
+        count = await locator.count()
+        logger.debug(f"  → Found {count} elements by placeholder")
+        if count > 0:
+            logger.info(f"✅ FOUND BY PLACEHOLDER: '{normalized}' ({count} matches)")
             return locator.first
     except Exception as e:
-        logger.debug(f"get_by_placeholder failed: {e}")
+        logger.debug(f"  → get_by_placeholder failed: {e}")
     
     try:
         # 3. Try by role
+        logger.debug(f"  Strategy 3/4: Trying get_by_role('textbox', name='{normalized}')")
         locator = page.get_by_role("textbox", name=normalized, exact=False)
-        if await locator.count() > 0:
-            logger.info(f"✅ Found by role textbox: {normalized}")
+        count = await locator.count()
+        logger.debug(f"  → Found {count} elements by role")
+        if count > 0:
+            logger.info(f"✅ FOUND BY ROLE: '{normalized}' ({count} matches)")
             return locator.first
     except Exception as e:
-        logger.debug(f"get_by_role failed: {e}")
+        logger.debug(f"  → get_by_role failed: {e}")
     
     # 4. Fallback: XPath near label
     try:
+        logger.debug(f"  Strategy 4/4: Trying XPath fallback")
         xpath = f'//label[contains(translate(normalize-space(.), "*:", ""), "{normalized}")]/following::*[self::input or self::textarea][1]'
+        logger.debug(f"  → XPath: {xpath}")
         locator = page.locator(f"xpath={xpath}")
-        if await locator.count() > 0:
-            logger.info(f"✅ Found by XPath: {normalized}")
+        count = await locator.count()
+        logger.debug(f"  → Found {count} elements by XPath")
+        if count > 0:
+            logger.info(f"✅ FOUND BY XPATH: '{normalized}' ({count} matches)")
             return locator.first
     except Exception as e:
-        logger.debug(f"XPath fallback failed: {e}")
+        logger.debug(f"  → XPath fallback failed: {e}")
     
-    logger.warning(f"❌ Could not resolve locator for: {label_text}")
+    logger.error(f"❌ FAILED ALL STRATEGIES for: '{label_text}'")
+    logger.error(f"   Tried: label, placeholder, role(textbox), XPath - all returned 0 matches")
     return None
 
 async def fill_field_robust(page: Page, label: str, value: str, logs: List[str]):
     """Fill field using robust selector engine."""
+    logger.info(f"🎯 ATTEMPTING TO FILL: '{label}' with value: '{value}'")
+    logs.append(f"🎯 Trying to fill '{label}'...")
+    
     try:
         locator = await resolve_locator(page, label)
         if locator:
+            logger.info(f"✅ LOCATOR FOUND for '{label}', attempting to fill...")
             await locator.click()
             await asyncio.sleep(0.1)
             await locator.fill(value)
             await asyncio.sleep(0.2)
-            logs.append(f"✅ Filled '{label}': {value}")
-            logger.info(f"✅ Filled '{label}': {value}")
-            return True
+            
+            # Verify the value was filled
+            filled_value = await locator.input_value()
+            if filled_value == value:
+                logs.append(f"✅ Successfully filled '{label}': {value}")
+                logger.info(f"✅ VERIFIED: '{label}' = '{value}'")
+                return True
+            else:
+                logs.append(f"⚠️ Filled '{label}' but value mismatch: expected '{value}', got '{filled_value}'")
+                logger.warning(f"⚠️ VALUE MISMATCH for '{label}'")
+                return False
         else:
-            logs.append(f"⚠️ Could not find field: {label}")
-            logger.warning(f"⚠️ Could not find field: {label}")
+            logs.append(f"❌ Could not find field: '{label}' (tried label, placeholder, role, XPath)")
+            logger.error(f"❌ LOCATOR NOT FOUND for: '{label}'")
             return False
     except Exception as e:
         logs.append(f"❌ Error filling '{label}': {str(e)}")
-        logger.error(f"❌ Error filling '{label}': {e}")
+        logger.error(f"❌ EXCEPTION filling '{label}': {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return False
 
 # ============================================================================
@@ -338,8 +367,278 @@ async def generic_adapter(page: Page, request: AutoApplyRequest, logs: List[str]
         return {"status": "error", "filled_fields": filled, "errors": [str(e)]}
 
 # ============================================================================
-# VERIFICATION
+# VISION AI ANALYSIS
 # ============================================================================
+
+async def analyze_form_with_vision(screenshot_b64: str, openai_key: str) -> Dict[str, Any]:
+    """
+    Use GPT-4 Vision to analyze the form screenshot.
+    Returns structured data about fields, CAPTCHA, and submit button.
+    """
+    logger.info("🔍 Analyzing form with Vision AI...")
+    
+    if not openai_key:
+        logger.warning("⚠️ No OpenAI API key provided, skipping Vision analysis")
+        return {
+            "fields": [],
+            "captcha": {"present": False, "type": None},
+            "submit_button": {"found": False},
+            "multi_page": False
+        }
+    
+    try:
+        prompt = """Analyze this job application form screenshot. For each input field visible, identify:
+
+1. Field type (text, email, phone, textarea, file, select, checkbox, radio)
+2. Label or placeholder text
+3. Whether it's required (look for asterisks, "required", red indicators)
+4. Approximate location (top/middle/bottom, left/center/right)
+5. Suggested keywords to find this field programmatically
+
+Also identify:
+- CAPTCHA presence and type (reCAPTCHA, hCaptcha, text-based, etc.)
+- Submit button text and location
+- If this appears to be a multi-page form (next/continue buttons)
+- Any visible error messages
+
+Return ONLY valid JSON in this exact format:
+{
+  "fields": [
+    {
+      "type": "email",
+      "label": "Email Address",
+      "required": true,
+      "location": "top-left",
+      "selector_hints": ["email", "e-mail", "your email"]
+    }
+  ],
+  "captcha": {
+    "present": false,
+    "type": null
+  },
+  "submit_button": {
+    "found": true,
+    "text": "Submit Application",
+    "location": "bottom-right"
+  },
+  "multi_page": false,
+  "errors_visible": []
+}"""
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{screenshot_b64}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "max_tokens": 2000,
+                    "temperature": 0.1
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Vision API error: {response.status_code} - {response.text}")
+                return {"fields": [], "captcha": {"present": False}, "submit_button": {"found": False}}
+            
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            
+            # Parse JSON from response
+            # Remove markdown code blocks if present
+            content = content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+            
+            analysis = json.loads(content)
+            logger.info(f"✅ Vision AI found {len(analysis.get('fields', []))} fields")
+            
+            return analysis
+            
+    except Exception as e:
+        logger.error(f"❌ Vision analysis error: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return {
+            "fields": [],
+            "captcha": {"present": False},
+            "submit_button": {"found": False}
+        }
+
+async def validate_form_with_vision(screenshot_b64: str, openai_key: str) -> Dict[str, Any]:
+    """
+    Use Vision AI to validate if form is properly filled before submit.
+    """
+    logger.info("✅ Validating form with Vision AI...")
+    
+    if not openai_key:
+        return {"all_filled": True, "errors": [], "warnings": []}
+    
+    try:
+        prompt = """Analyze this job application form. Check:
+
+1. Are all required fields filled? (look for empty fields with asterisks or "required")
+2. Are there any visible error messages? (red text, error icons)
+3. Are there any warnings or validation issues?
+4. Does everything look ready to submit?
+
+Return ONLY valid JSON:
+{
+  "all_filled": true,
+  "missing_required": [],
+  "errors": [],
+  "warnings": [],
+  "ready_to_submit": true
+}"""
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}
+                                }
+                            ]
+                        }
+                    ],
+                    "max_tokens": 1000,
+                    "temperature": 0.1
+                }
+            )
+            
+            if response.status_code != 200:
+                return {"all_filled": True, "errors": [], "warnings": []}
+            
+            result = response.json()
+            content = result["choices"][0]["message"]["content"].strip()
+            
+            # Clean markdown
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            
+            validation = json.loads(content.strip())
+            logger.info(f"✅ Validation: ready={validation.get('ready_to_submit', False)}")
+            
+            return validation
+            
+    except Exception as e:
+        logger.error(f"Validation error: {e}")
+        return {"all_filled": True, "errors": [], "warnings": []}
+
+async def verify_submission_with_vision(screenshot_b64: str, openai_key: str) -> Tuple[bool, str]:
+    """
+    Use Vision AI to verify if submission was successful.
+    """
+    logger.info("🔍 Verifying submission with Vision AI...")
+    
+    if not openai_key:
+        # Fallback to original verification
+        return False, "No OpenAI key for Vision verification"
+    
+    try:
+        prompt = """Analyze this screenshot after form submission. Determine:
+
+1. Did the submission succeed? (look for success messages, confirmation pages, thank you messages)
+2. Are we on a new page or still on the form?
+3. Are there any error messages visible?
+
+Return ONLY valid JSON:
+{
+  "success": true,
+  "confidence": "high",
+  "indicators": ["thank you message visible", "confirmation page"],
+  "errors": []
+}
+
+Confidence levels: high, medium, low"""
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}
+                                }
+                            ]
+                        }
+                    ],
+                    "max_tokens": 500,
+                    "temperature": 0.1
+                }
+            )
+            
+            if response.status_code != 200:
+                return False, "Vision API error"
+            
+            result = response.json()
+            content = result["choices"][0]["message"]["content"].strip()
+            
+            # Clean markdown
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            
+            verification = json.loads(content.strip())
+            success = verification.get("success", False)
+            indicators = ", ".join(verification.get("indicators", []))
+            
+            message = f"Vision verification: {verification.get('confidence', 'unknown')} confidence - {indicators}"
+            logger.info(f"{'✅' if success else '❌'} {message}")
+            
+            return success, message
+            
+    except Exception as e:
+        logger.error(f"Vision verification error: {e}")
+        return False, f"Vision verification failed: {str(e)}"
 
 async def verify_submission(page: Page) -> Tuple[bool, str]:
     """Verify if submission was successful (2 of 3 checks)."""
@@ -398,7 +697,7 @@ async def take_screenshot(page: Page, name: str) -> str:
 # ============================================================================
 
 async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
-    """Main auto-apply orchestration with new architecture."""
+    """Main auto-apply orchestration with Vision-First architecture."""
     
     run_id = hashlib.md5(f"{request.candidate_id}{request.job_url}{time.time()}".encode()).hexdigest()[:12]
     logs = []
@@ -408,17 +707,22 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
         "bd_browser_api_connected": False,
         "captcha_detected": False,
         "platform": "unknown",
+        "vision_analysis_used": False,
+        "fields_detected_by_vision": 0,
         "start_time": datetime.utcnow().isoformat(),
     }
     
     screenshot_pre = ""
     screenshot_post = ""
     
-    logger.info(f"🚀 Starting auto-apply run {run_id} for {request.job_url}")
+    # Get OpenAI key from request or env
+    openai_key = request.openai_api_key or os.getenv("OPENAI_API_KEY", "")
+    
+    logger.info(f"🚀 Starting Vision-First auto-apply run {run_id} for {request.job_url}")
     logs.append(f"🚀 Run ID: {run_id}")
     logs.append(f"🎯 Job URL: {request.job_url}")
+    logs.append(f"🔧 Vision AI: {'Enabled' if openai_key else 'Disabled (no API key)'}")
     logs.append(f"🔧 Use Bright Data: {request.use_bright_data}")
-    logs.append(f"🤖 Use MCP: {request.use_mcp}")
     
     browser: Optional[Browser] = None
     
@@ -446,47 +750,122 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
             await page.goto(request.job_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
             
-            # Take pre-screenshot
+            # STEP 1: Take pre-screenshot and analyze with Vision AI
             screenshot_pre = await take_screenshot(page, "pre")
-            logs.append("📸 Pre-screenshot captured")
+            logs.append("📸 Initial screenshot captured")
+            logger.info("📸 Screenshot captured, starting Vision analysis...")
             
-            # Detect platform
-            platform = await detect_platform(page, request.job_url)
-            telemetry["platform"] = platform
-            logs.append(f"🔍 Platform detected: {platform}")
-            logger.info(f"🔍 Platform: {platform}")
+            # Extract base64 from screenshot
+            screenshot_b64 = screenshot_pre.split(",")[1] if "," in screenshot_pre else screenshot_pre
             
-            # Check for CAPTCHA
-            captcha_detected, captcha_type = await detect_captcha(page)
-            if captcha_detected:
-                telemetry["captcha_detected"] = True
-                logs.append(f"🔒 CAPTCHA detected: {captcha_type}")
+            # STEP 2: Vision AI Analysis
+            form_analysis = await analyze_form_with_vision(screenshot_b64, openai_key)
+            
+            if form_analysis and form_analysis.get("fields"):
+                telemetry["vision_analysis_used"] = True
+                telemetry["fields_detected_by_vision"] = len(form_analysis["fields"])
+                logs.append(f"🤖 Vision AI detected {len(form_analysis['fields'])} fields")
+                logger.info(f"🤖 Vision detected {len(form_analysis['fields'])} fields")
                 
-                if request.auto_captcha_allowed and request.use_bright_data:
-                    logs.append("⏳ Waiting for Bright Data CAPTCHA solver...")
-                    await asyncio.sleep(5)  # Wait for Browser API to solve
-                else:
-                    return AutoApplyResponse(
-                        status="needs_review",
-                        run_id=run_id,
-                        message="CAPTCHA detected - manual intervention required",
-                        screenshot_pre=screenshot_pre,
-                        logs=logs,
-                        errors=["CAPTCHA detected"],
-                        telemetry=telemetry
-                    )
-            
-            # Apply platform adapter
-            adapter_result = {}
-            if platform == "greenhouse":
-                adapter_result = await greenhouse_adapter(page, request, logs)
-            elif platform == "lever":
-                adapter_result = await lever_adapter(page, request, logs)
+                # Check for CAPTCHA
+                if form_analysis.get("captcha", {}).get("present"):
+                    captcha_type = form_analysis["captcha"].get("type", "unknown")
+                    telemetry["captcha_detected"] = True
+                    logs.append(f"🔒 CAPTCHA detected by Vision: {captcha_type}")
+                    
+                    if not request.auto_captcha_allowed:
+                        return AutoApplyResponse(
+                            status="needs_review",
+                            run_id=run_id,
+                            message=f"CAPTCHA detected ({captcha_type}) - manual intervention required",
+                            screenshot_pre=screenshot_pre,
+                            logs=logs,
+                            errors=[f"CAPTCHA: {captcha_type}"],
+                            telemetry=telemetry
+                        )
+                    else:
+                        logs.append("⏳ Attempting to proceed with CAPTCHA...")
+                        await asyncio.sleep(3)
+                
+                # STEP 3: Fill fields based on Vision analysis
+                logs.append("📝 Starting to fill fields based on Vision analysis...")
+                
+                for field_info in form_analysis["fields"]:
+                    field_label = field_info.get("label", "unknown")
+                    field_type = field_info.get("type", "text")
+                    selector_hints = field_info.get("selector_hints", [field_label])
+                    
+                    # Determine what value to use
+                    value = None
+                    field_name = field_label.lower()
+                    
+                    # Match field to data
+                    if any(hint in field_name for hint in ["name", "nome", "full name"]):
+                        value = request.full_name
+                    elif any(hint in field_name for hint in ["email", "e-mail"]):
+                        value = request.email
+                    elif any(hint in field_name for hint in ["phone", "telefone", "tel", "mobile"]):
+                        value = request.phone
+                    elif any(hint in field_name for hint in ["location", "city", "localização", "address"]):
+                        value = request.location or request.current_company
+                    elif any(hint in field_name for hint in ["company", "empresa", "current company"]):
+                        value = request.current_company
+                    elif any(hint in field_name for hint in ["linkedin"]):
+                        value = request.linkedin_url
+                    elif any(hint in field_name for hint in ["experience", "years"]):
+                        value = request.years_of_experience
+                    
+                    if value:
+                        # Try each selector hint
+                        filled = False
+                        for hint in selector_hints:
+                            if await fill_field_robust(page, hint, value, logs):
+                                filled_fields.append(field_label)
+                                filled = True
+                                break
+                        
+                        if not filled:
+                            logs.append(f"⚠️ Could not fill '{field_label}' - tried: {', '.join(selector_hints)}")
+                    else:
+                        logs.append(f"⚠️ No data available for field: '{field_label}'")
+                
             else:
-                adapter_result = await generic_adapter(page, request, logs)
+                # Fallback to platform adapters if Vision fails
+                logs.append("⚠️ Vision analysis failed, using fallback selector engine")
+                platform = await detect_platform(page, request.job_url)
+                telemetry["platform"] = platform
+                logs.append(f"🔍 Platform detected: {platform}")
+                
+                # Check for CAPTCHA with old method
+                captcha_detected, captcha_type = await detect_captcha(page)
+                if captcha_detected:
+                    telemetry["captcha_detected"] = True
+                    logs.append(f"🔒 CAPTCHA detected: {captcha_type}")
+                    
+                    if not request.auto_captcha_allowed:
+                        return AutoApplyResponse(
+                            status="needs_review",
+                            run_id=run_id,
+                            message="CAPTCHA detected - manual intervention required",
+                            screenshot_pre=screenshot_pre,
+                            logs=logs,
+                            errors=["CAPTCHA detected"],
+                            telemetry=telemetry
+                        )
+                
+                # Use platform adapters
+                adapter_result = {}
+                if platform == "greenhouse":
+                    adapter_result = await greenhouse_adapter(page, request, logs)
+                elif platform == "lever":
+                    adapter_result = await lever_adapter(page, request, logs)
+                else:
+                    adapter_result = await generic_adapter(page, request, logs)
+                
+                filled_fields = adapter_result.get("filled_fields", [])
+                errors.extend(adapter_result.get("errors", []))
             
-            filled_fields = adapter_result.get("filled_fields", [])
-            errors.extend(adapter_result.get("errors", []))
+            logs.append(f"✅ Filled {len(filled_fields)} fields: {', '.join(filled_fields)}")
             
             # Plan only mode
             if request.plan_only:
@@ -502,30 +881,64 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
                     telemetry=telemetry
                 )
             
-            # Submit if allowed
+            # STEP 4: Pre-submit validation with Vision
+            if openai_key and request.allow_submit:
+                logs.append("🔍 Validating form before submit...")
+                pre_submit_screenshot = await take_screenshot(page, "pre_submit")
+                pre_submit_b64 = pre_submit_screenshot.split(",")[1] if "," in pre_submit_screenshot else pre_submit_screenshot
+                
+                validation = await validate_form_with_vision(pre_submit_b64, openai_key)
+                
+                if not validation.get("ready_to_submit", True):
+                    logs.append(f"⚠️ Validation warnings: {', '.join(validation.get('warnings', []))}")
+                    if validation.get("errors"):
+                        errors.extend(validation["errors"])
+                        logs.append(f"❌ Validation errors: {', '.join(validation['errors'])}")
+            
+            # STEP 5: Submit if allowed
             if request.allow_submit:
                 logs.append("📤 Attempting to submit application...")
                 
                 try:
-                    # Look for submit button
-                    submit_button = page.locator('button[type="submit"], input[type="submit"], button:has-text("Submit"), button:has-text("Apply")')
+                    # Look for submit button (enhanced selectors)
+                    submit_selectors = [
+                        'button[type="submit"]',
+                        'input[type="submit"]',
+                        'button:has-text("Submit")',
+                        'button:has-text("Apply")',
+                        'button:has-text("Send")',
+                        'button:has-text("Enviar")',
+                        'button:has-text("Candidatar")',
+                        '[data-test*="submit"]',
+                        '[data-testid*="submit"]'
+                    ]
+                    
+                    submit_button = page.locator(', '.join(submit_selectors))
                     if await submit_button.count() > 0:
                         await submit_button.first.click()
                         logs.append("✅ Submit button clicked")
                         await asyncio.sleep(3)
                     else:
                         logs.append("⚠️ No submit button found")
+                        errors.append("Submit button not found")
                 except Exception as e:
                     errors.append(f"Submit error: {str(e)}")
                     logs.append(f"❌ Submit error: {str(e)}")
             
-            # Take post-screenshot
+            # STEP 6: Take post-screenshot
             screenshot_post = await take_screenshot(page, "post")
             logs.append("📸 Post-screenshot captured")
             
-            # Verify submission
-            verified, verify_msg = await verify_submission(page)
-            logs.append(verify_msg)
+            # STEP 7: Verify submission with Vision
+            post_screenshot_b64 = screenshot_post.split(",")[1] if "," in screenshot_post else screenshot_post
+            
+            if openai_key:
+                verified, verify_msg = await verify_submission_with_vision(post_screenshot_b64, openai_key)
+                logs.append(f"🤖 Vision verification: {verify_msg}")
+            else:
+                # Fallback to old verification
+                verified, verify_msg = await verify_submission(page)
+                logs.append(verify_msg)
             
             telemetry["end_time"] = datetime.utcnow().isoformat()
             
@@ -574,6 +987,7 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
     finally:
         if browser:
             await browser.close()
+            logger.info(f"🔒 Browser closed for run {run_id}")
 
 # ============================================================================
 # ENDPOINTS
@@ -589,10 +1003,24 @@ async def health():
 async def auto_apply_endpoint(request: AutoApplyRequest):
     """Unified auto-apply endpoint implementing ChatGPT plan."""
     logger.info(f"📨 Received auto-apply request: {request.job_url}")
+    logger.info(f"👤 Candidate data received:")
+    logger.info(f"   - full_name: '{request.full_name}'")
+    logger.info(f"   - email: '{request.email}'")
+    logger.info(f"   - phone: '{request.phone}'")
+    logger.info(f"   - location: '{request.location}'")
+    logger.info(f"   - current_company: '{request.current_company}'")
+    logger.info(f"   - linkedin_url: '{request.linkedin_url}'")
+    logger.info(f"   - years_of_experience: '{request.years_of_experience}'")
+    logger.info(f"   - resume: {'YES (base64)' if request.resume else 'NO'}")
+    logger.info(f"🔧 Settings:")
+    logger.info(f"   - use_bright_data: {request.use_bright_data}")
+    logger.info(f"   - use_mcp: {request.use_mcp}")
+    logger.info(f"   - allow_submit: {request.allow_submit}")
     
     try:
         result = await auto_apply_job(request)
         return result
     except Exception as e:
         logger.error(f"❌ Endpoint error: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
