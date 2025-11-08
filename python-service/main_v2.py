@@ -813,35 +813,64 @@ async def lever_adapter(page: Page, request: AutoApplyRequest, logs: List[str]) 
         # CRITICAL: Lever requires clicking "Apply" button to open the form modal
         logs.append("🔍 Looking for Apply button to open form...")
         
-        # Try multiple selectors for the Apply button
-        apply_selectors = [
-            "a.postings-btn",  # Common Lever Apply button
-            "a[href*='apply']",
-            "button:has-text('Apply')",
-            "a:has-text('Apply')",
-            "button:has-text('apply')",
-            "a:has-text('apply')",
+        # Try multiple strategies to find and click the Apply button
+        apply_strategies = [
+            ("a.postings-btn", "CSS class postings-btn"),
+            ("a.posting-apply-button", "CSS class posting-apply-button"),
+            ("a[href*='apply']", "Link containing 'apply'"),
         ]
         
         apply_clicked = False
-        for selector in apply_selectors:
+        for selector, description in apply_strategies:
             try:
+                logger.info(f"🔍 Trying Apply selector: {selector} ({description})")
                 btn = page.locator(selector).first
-                if await btn.count() > 0 and await btn.is_visible():
-                    logs.append(f"✅ Found Apply button: {selector}")
-                    await btn.click()
-                    logs.append("✅ Clicked Apply button")
-                    apply_clicked = True
-                    
-                    # Wait for form/modal to appear
-                    await asyncio.sleep(2)
-                    logs.append("⏳ Waiting for form modal to load...")
-                    break
+                
+                # Wait for element with timeout
+                await btn.wait_for(state="visible", timeout=5000)
+                logs.append(f"✅ Found Apply button: {description}")
+                
+                await btn.click()
+                logs.append("✅ Clicked Apply button")
+                apply_clicked = True
+                
+                # Wait for modal/iframe to appear
+                await asyncio.sleep(3)
+                logs.append("⏳ Form modal should be visible now")
+                break
+                
             except Exception as e:
+                logger.info(f"⚠️ Strategy '{description}' failed: {str(e)[:100]}")
                 continue
         
         if not apply_clicked:
             logs.append("⚠️ Apply button not found - assuming form is already visible")
+        
+        # CRITICAL: Check if Lever form is in an iframe and switch context
+        try:
+            logger.info("🔍 Checking for Lever iframe...")
+            frames = page.frames
+            lever_frame = None
+            
+            for frame in frames:
+                frame_url = frame.url
+                if "lever.co" in frame_url or "lever" in frame_url.lower():
+                    lever_frame = frame
+                    logger.info(f"✅ Found Lever iframe: {frame_url}")
+                    logs.append(f"✅ Detected Lever iframe")
+                    break
+            
+            # If iframe found, use it as the page context for filling
+            if lever_frame:
+                page = lever_frame
+                logs.append("🔄 Switched context to Lever iframe")
+                await asyncio.sleep(1)
+            else:
+                logger.info("ℹ️ No Lever iframe found - using main page")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Error checking for iframe: {str(e)[:100]}")
+            logs.append(f"⚠️ Could not detect iframe: {str(e)[:50]}")
         
         # NOW fill the form fields
         # Name: try full_name first, then split if needed
