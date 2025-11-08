@@ -805,11 +805,45 @@ async def greenhouse_adapter(page: Page, request: AutoApplyRequest, logs: List[s
         return {"status": "error", "filled_fields": filled, "errors": [str(e)]}
 
 async def lever_adapter(page: Page, request: AutoApplyRequest, logs: List[str]) -> Dict[str, Any]:
-    """Lever-specific logic with robust name filling."""
+    """Lever-specific logic: OPEN the application modal first, then fill."""
     logger.info("⚡ Using Lever adapter")
     filled = []
     
     try:
+        # CRITICAL: Lever requires clicking "Apply" button to open the form modal
+        logs.append("🔍 Looking for Apply button to open form...")
+        
+        # Try multiple selectors for the Apply button
+        apply_selectors = [
+            "a.postings-btn",  # Common Lever Apply button
+            "a[href*='apply']",
+            "button:has-text('Apply')",
+            "a:has-text('Apply')",
+            "button:has-text('apply')",
+            "a:has-text('apply')",
+        ]
+        
+        apply_clicked = False
+        for selector in apply_selectors:
+            try:
+                btn = page.locator(selector).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    logs.append(f"✅ Found Apply button: {selector}")
+                    await btn.click()
+                    logs.append("✅ Clicked Apply button")
+                    apply_clicked = True
+                    
+                    # Wait for form/modal to appear
+                    await asyncio.sleep(2)
+                    logs.append("⏳ Waiting for form modal to load...")
+                    break
+            except Exception as e:
+                continue
+        
+        if not apply_clicked:
+            logs.append("⚠️ Apply button not found - assuming form is already visible")
+        
+        # NOW fill the form fields
         # Name: try full_name first, then split if needed
         if request.full_name:
             logger.info("📝 Trying full_name field...")
