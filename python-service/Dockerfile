@@ -15,4 +15,4 @@ ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Arranque FastAPI - Railway define $PORT dinamicamente
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
+CMD uvicorn main_v2:app --host 0.0.0.0 --port ${PORT:-8080}
