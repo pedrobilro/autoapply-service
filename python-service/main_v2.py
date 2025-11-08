@@ -212,7 +212,7 @@ async def fill_field_robust(page: Page, label: str, value: str, logs: List[str])
 # ============================================================================
 
 def get_bright_data_proxy(username: str, password: str) -> Optional[Dict[str, str]]:
-    """Build Bright Data proxy config."""
+    """Build Bright Data HTTP proxy config (legacy)."""
     if not username or not password:
         return None
     
@@ -224,6 +224,14 @@ def get_bright_data_proxy(username: str, password: str) -> Optional[Dict[str, st
         "username": username,
         "password": password,
     }
+
+def get_bright_data_browser_api_endpoint(username: str, password: str) -> Optional[str]:
+    """Build Bright Data Browser API WebSocket endpoint."""
+    if not username or not password:
+        return None
+    
+    # Format: wss://username:password@brd.superproxy.io:9222
+    return f"wss://{username}:{password}@brd.superproxy.io:9222"
 
 async def detect_captcha(page: Page) -> Tuple[bool, str]:
     """Detect CAPTCHA on page."""
@@ -728,27 +736,94 @@ async def auto_apply_job(request: AutoApplyRequest) -> AutoApplyResponse:
     
     try:
         async with async_playwright() as p:
-            # Bright Data proxy setup
-            launch_options = {
-                "headless": True,
-                "args": ["--no-sandbox", "--disable-setuid-sandbox"]
-            }
-            
+            # Bright Data Browser API setup
             if request.use_bright_data and request.brightdata_username and request.brightdata_password:
-                proxy_config = get_bright_data_proxy(request.brightdata_username, request.brightdata_password)
-                if proxy_config:
-                    launch_options["proxy"] = proxy_config
-                    telemetry["bd_browser_api_connected"] = True
-                    logs.append("✅ Bright Data proxy connected")
-                    logger.info("✅ Bright Data proxy configured")
+                # Use Browser API endpoint (WSS connection)
+                ws_endpoint = get_bright_data_browser_api_endpoint(
+                    request.brightdata_username, 
+                    request.brightdata_password
+                )
+                
+                if ws_endpoint:
+                    try:
+                        logs.append(f"🔌 Connecting to Bright Data Browser API...")
+                        logger.info(f"Connecting to Browser API: {ws_endpoint[:50]}...")
+                        
+                        browser = await p.chromium.connect_over_cdp(ws_endpoint)
+                        telemetry["bd_browser_api_connected"] = True
+                        logs.append("✅ Bright Data Browser API connected")
+                        logger.info("✅ Bright Data Browser API connected")
+                    except Exception as e:
+                        logs.append(f"❌ Failed to connect to Browser API: {str(e)[:100]}")
+                        logger.error(f"Browser API connection failed: {e}")
+                        raise Exception(f"Bright Data Browser API connection failed: {str(e)}")
+            else:
+                # Launch local browser without proxy
+                launch_options = {
+                    "headless": True,
+                    "args": ["--no-sandbox", "--disable-setuid-sandbox"]
+                }
+                browser = await p.chromium.launch(**launch_options)
+                logs.append("🌐 Using local browser (no Bright Data)")
             
-            browser = await p.chromium.launch(**launch_options)
-            page = await browser.new_page()
+            # Get or create page with stealth configurations
+            contexts = browser.contexts
+            if contexts:
+                context = contexts[0]
+                pages = context.pages
+                page = pages[0] if pages else await context.new_page()
+            else:
+                # Create new context with stealth settings
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-US",
+                    timezone_id="America/New_York"
+                )
+                page = await context.new_page()
             
-            # Navigate to job page
+            # Set realistic headers
+            await page.set_extra_http_headers({
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1"
+            })
+            
+            # Navigate to job page with multiple strategies and retry logic
             logs.append(f"🌐 Navigating to {request.job_url}")
-            await page.goto(request.job_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2)
+            max_retries = 3
+            wait_strategies = ["domcontentloaded", "networkidle", "load"]
+            
+            navigation_successful = False
+            for attempt in range(max_retries):
+                for wait_strategy in wait_strategies:
+                    try:
+                        logs.append(f"🔄 Attempt {attempt + 1}/{max_retries} with '{wait_strategy}' strategy...")
+                        await page.goto(request.job_url, wait_until=wait_strategy, timeout=120000)
+                        logs.append(f"✅ Page loaded successfully!")
+                        navigation_successful = True
+                        break
+                    except Exception as e:
+                        logs.append(f"⚠️ '{wait_strategy}' strategy failed: {str(e)[:100]}")
+                        if wait_strategy == wait_strategies[-1]:  # Last strategy
+                            if attempt < max_retries - 1:
+                                logs.append(f"⏳ Waiting 5 seconds before retry...")
+                                await asyncio.sleep(5)
+                        continue
+                
+                if navigation_successful:
+                    break
+            
+            if not navigation_successful:
+                raise Exception(f"Failed to load page after {max_retries} attempts with all strategies")
+            
+            # Simulate human behavior
+            await asyncio.sleep(random.uniform(2, 4))
+            await page.evaluate("window.scrollTo(0, 500)")
+            await asyncio.sleep(random.uniform(1, 2))
             
             # STEP 1: Take pre-screenshot and analyze with Vision AI
             screenshot_pre = await take_screenshot(page, "pre")
