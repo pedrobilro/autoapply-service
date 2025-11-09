@@ -1598,9 +1598,30 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                 log_message(messages, "🌐 Conectando via Bright Data Browser API...")
                 log_message(messages, f"   Username: {brightdata_username[:20]}...")
                 browser_endpoint = f"wss://{brightdata_username}:{brightdata_password}@brd.superproxy.io:9222"
+                
+                # Retry logic para conexão ao Bright Data
+                browser = None
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        log_message(messages, f"   Tentativa {attempt + 1}/3...")
+                        browser = await p.chromium.connect_over_cdp(
+                            browser_endpoint,
+                            timeout=90000  # 90s
+                        )
+                        log_message(messages, "✅ Conectado ao Bright Data Browser API")
+                        break
+                    except Exception as e:
+                        last_err = e
+                        log_message(messages, f"⚠️ Tentativa {attempt + 1} falhou: {str(e)[:100]}")
+                        if attempt < 2:
+                            log_message(messages, "   ⏳ A aguardar antes de nova tentativa...")
+                            await asyncio.sleep(3)
+                
+                if not browser:
+                    raise last_err or Exception("Falha ao conectar ao Bright Data após 3 tentativas")
+                
                 try:
-                    browser = await p.chromium.connect_over_cdp(browser_endpoint)
-                    log_message(messages, "✅ Conectado ao Bright Data Browser API")
                     log_message(messages, "   • CAPTCHA solving automático ativado")
                     log_message(messages, "   • Proxy residencial ativado")
                     log_message(messages, "   • Anti-bot evasion ativado")
