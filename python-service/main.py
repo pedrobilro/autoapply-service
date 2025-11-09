@@ -1605,30 +1605,17 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     log_message(messages, "   • Proxy residencial ativado")
                     log_message(messages, "   • Anti-bot evasion ativado")
                     
-                    # Obter URL de inspeção para ver browser em tempo real
-                    try:
-                        context = await browser.new_context(
-                            viewport={'width': 1920, 'height': 1080},
-                            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                        )
-                        page = await context.new_page()
-                        client = await context.new_cdp_session(page)
-                        
-                        frames = await client.send('Page.getFrameTree')
-                        frame_id = frames['frameTree']['frame']['id']
-                        inspect_result = await client.send('Page.inspect', {'frameId': frame_id})
-                        inspect_url = inspect_result.get('url')
-                        
-                        if inspect_url:
-                            log_message(messages, f"🔍 URL de Inspeção: {inspect_url}")
-                            log_message(messages, "   Abra este URL para ver o browser em tempo real!")
-                    except Exception as e:
-                        log_message(messages, f"⚠️ Não foi possível obter URL de inspeção: {e}")
-                        context = await browser.new_context(
-                            viewport={'width': 1920, 'height': 1080},
-                            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                        )
-                        page = await context.new_page()
+                    # Bright Data não fornece inspect URL automático
+                    # As sessões podem ser vistas no dashboard: https://brightdata.com/cp/zones
+                    inspect_url = f"https://brightdata.com/cp/zones"
+                    log_message(messages, f"🌐 Bright Data ativado - veja sessões ativas em: {inspect_url}")
+                    log_message(messages, "   Nota: Aceda ao dashboard do Bright Data > Zones para monitorizar a sessão")
+                    
+                    context = await browser.new_context(
+                        viewport={'width': 1920, 'height': 1080},
+                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    )
+                    page = await context.new_page()
                         
                 except Exception as e:
                     log_message(messages, f"❌ Falha ao conectar Bright Data: {e}")
