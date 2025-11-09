@@ -145,6 +145,8 @@ class ApplyRequest(BaseModel):
     plan_only: bool = False
     allow_submit: bool = True
     openai_api_key: Optional[str] = None
+    brightdata_username: Optional[str] = None
+    brightdata_password: Optional[str] = None
 
 # --------------------------
 # Helpers
@@ -729,6 +731,48 @@ async def solve_captcha_improved(page, messages: List[str]) -> bool:
     
     log_message(messages, "⚠️ Não foi possível resolver CAPTCHA automaticamente")
     return False
+
+async def solve_captcha_brightdata(page, messages: List[str], use_brightdata: bool = False) -> bool:
+    """
+    Usa Bright Data Browser API para resolver CAPTCHAs automaticamente via CDP.
+    Bright Data detecta e resolve automaticamente reCAPTCHA, hCaptcha, etc.
+    """
+    if not use_brightdata:
+        log_message(messages, "⚠️ Bright Data não está ativo - usando fallback")
+        return await solve_captcha_improved(page, messages)
+    
+    log_message(messages, "🌐 Usando Bright Data CAPTCHA Solver...")
+    
+    try:
+        # Obter CDP session do contexto do navegador
+        context = page.context
+        client = await context.new_cdp_session(page)
+        
+        log_message(messages, "🔍 Aguardando Bright Data detectar e resolver CAPTCHA...")
+        
+        # Bright Data automaticamente detecta e resolve CAPTCHAs
+        # Apenas aguardamos com timeout de 10 segundos para detecção
+        result = await client.send('Captcha.waitForSolve', {
+            'detectTimeout': 10000,  # 10 segundos para detectar
+        })
+        
+        status = result.get('status', 'unknown')
+        log_message(messages, f"📊 Status do CAPTCHA: {status}")
+        
+        if status == 'solve_success':
+            log_message(messages, "✅ CAPTCHA resolvido automaticamente pelo Bright Data!")
+            return True
+        elif status == 'not_detected':
+            log_message(messages, "ℹ️ Nenhum CAPTCHA detectado pela Bright Data")
+            return False
+        else:
+            log_message(messages, f"⚠️ Status desconhecido: {status}")
+            return False
+            
+    except Exception as e:
+        log_message(messages, f"❌ Erro ao usar Bright Data CAPTCHA solver: {e}")
+        log_message(messages, "🔄 Tentando fallback com 2captcha...")
+        return await solve_captcha_improved(page, messages)
 
 async def solve_captcha(page, messages: List[str]) -> bool:
     """
@@ -1527,6 +1571,7 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
     post_submit_b64 = ""
     ok = False
     status = "unknown"
+    inspect_url = None
 
     pdf_bytes = await load_resume_bytes(user_data.get("resume_url"), user_data.get("resume_b64"))
     if pdf_bytes:
@@ -1540,9 +1585,9 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
     if missing:
         return {"ok": False, "status": "missing_fields", "missing": missing, "log": messages}
 
-    # Bright Data Browser API credentials
-    brightdata_username = os.getenv("BRIGHTDATA_USERNAME")
-    brightdata_password = os.getenv("BRIGHTDATA_PASSWORD")
+    # Bright Data Browser API credentials - tentar do payload primeiro, depois env vars
+    brightdata_username = user_data.get("brightdata_username") or os.getenv("BRIGHTDATA_USERNAME")
+    brightdata_password = user_data.get("brightdata_password") or os.getenv("BRIGHTDATA_PASSWORD")
     
     use_brightdata = brightdata_username and brightdata_password
 
@@ -1550,13 +1595,55 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
         async with async_playwright() as p:
             # Usar Bright Data Browser API se credenciais estiverem disponíveis
             if use_brightdata:
-                log_message(messages, "🌐 Conectando via Bright Data Browser API (CAPTCHA automático)...")
+                log_message(messages, "🌐 Conectando via Bright Data Browser API...")
+                log_message(messages, f"   Username: {brightdata_username[:20]}...")
                 browser_endpoint = f"wss://{brightdata_username}:{brightdata_password}@brd.superproxy.io:9222"
                 try:
                     browser = await p.chromium.connect_over_cdp(browser_endpoint)
-                    log_message(messages, "✓ Conectado ao Bright Data - CAPTCHAs serão resolvidos automaticamente")
+                    log_message(messages, "✅ Conectado ao Bright Data Browser API")
+                    log_message(messages, "   • CAPTCHA solving automático ativado")
+                    log_message(messages, "   • Proxy residencial ativado")
+                    log_message(messages, "   • Anti-bot evasion ativado")
+                    
+                    # Bright Data não fornece inspect URL via API
+                    # As sessões podem ser monitorizadas em: https://brightdata.com/cp/zones
+                    log_message(messages, "🌐 Bright Data proxy ativado")
+                    log_message(messages, f"   📡 Proxy endpoint: {brightdata_username.split('-')[0] if brightdata_username else 'unknown'}")
+                    log_message(messages, "   ℹ️ Monitorize sessões em: https://brightdata.com/cp/zones > Event log")
+                    log_message(messages, "   ⏰ Nota: Pode demorar alguns segundos até aparecer no dashboard")
+                    
+                    context = await browser.new_context(
+                        viewport={'width': 1920, 'height': 1080},
+                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    )
+                    page = await context.new_page()
+                    
+                    # Testar conexão Bright Data
+                    log_message(messages, "🔍 A testar conexão Bright Data...")
+                    try:
+                        test_response = await page.goto("https://lumtest.com/myip.json", wait_until="domcontentloaded", timeout=30000)
+                        if test_response and test_response.ok:
+                            ip_text = await page.content()
+                            log_message(messages, f"✅ Bright Data conectado! Resposta recebida")
+                            # Tentar extrair IP dos dados
+                            try:
+                                import json
+                                import re
+                                json_match = re.search(r'\{[^}]+\}', ip_text)
+                                if json_match:
+                                    ip_data = json.loads(json_match.group())
+                                    log_message(messages, f"   📍 IP: {ip_data.get('ip', 'unknown')}")
+                                    log_message(messages, f"   🌍 País: {ip_data.get('country', 'unknown')}")
+                            except:
+                                log_message(messages, "   ✅ Conexão verificada (detalhes não disponíveis)")
+                        else:
+                            log_message(messages, "⚠️ Resposta inesperada ao testar Bright Data")
+                    except Exception as test_err:
+                        log_message(messages, f"⚠️ Erro ao testar Bright Data: {test_err}")
+                        log_message(messages, "   Continuando mesmo assim...")
+                        
                 except Exception as e:
-                    log_message(messages, f"⚠ Falha ao conectar Bright Data: {e}")
+                    log_message(messages, f"❌ Falha ao conectar Bright Data: {e}")
                     log_message(messages, "🔄 Usando Playwright local como fallback...")
                     use_brightdata = False
             
@@ -1577,12 +1664,13 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                 ]
             )
             
-            context = await browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
+                context = await browser.new_context(
+                    viewport={'width': 1920, 'height': 1080},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                )
+                
+                page = await context.new_page()
             
-            page = await context.new_page()
             page.set_default_timeout(15000)
             
             # Remover propriedades que indicam automação
@@ -1750,19 +1838,16 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     # Consent/Privacy (não incluir reCAPTCHA por agora)
                     await try_click_privacy_consent(page, messages)
                     
-                    # Tentar resolver CAPTCHA (só se não estiver usando Bright Data)
-                    if use_brightdata:
-                        log_message(messages, "⏭️ Bright Data ativo - CAPTCHAs são resolvidos automaticamente, pulando resolução manual")
-                    else:
-                        captcha_attempt = 0
-                        while captcha_attempt < 3:
-                            if await solve_captcha_improved(page, messages):
-                                app_state.captcha_solved = True
-                                log_message(messages, "✅ CAPTCHA resolvido")
-                                break
-                            captcha_attempt += 1
-                            if not await retry_system.should_retry("captcha", captcha_attempt, messages):
-                                break
+                    # Resolver CAPTCHA usando Bright Data se disponível, senão fallback
+                    captcha_attempt = 0
+                    while captcha_attempt < 3:
+                        if await solve_captcha_brightdata(page, messages, use_brightdata):
+                            app_state.captcha_solved = True
+                            log_message(messages, "✅ CAPTCHA resolvido")
+                            break
+                        captcha_attempt += 1
+                        if not await retry_system.should_retry("captcha", captcha_attempt, messages):
+                            break
 
 
                     # Forçar HTML5 validity
@@ -1925,6 +2010,7 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
         "platform": app_state.platform_detected or None,
         "log": messages,
         "screenshot": (post_submit_b64 or screenshot_b64 or ""),  # compat
+        "inspect_url": inspect_url,  # URL para ver browser em tempo real
         "evidence": {
             "pre_submit_screenshot_b64": pre_submit_b64 or "",
             "post_submit_screenshot_b64": post_submit_b64 or screenshot_b64 or ""
@@ -1966,6 +2052,7 @@ async def auto_apply(req: ApplyRequest):
             "platform": result.get("platform") or (result.get("state", {}) or {}).get("platform_detected"),
             "evidence": result.get("evidence", {}),
             "log": result.get("log", []),
+            "inspect_url": result.get("inspect_url"),  # URL de inspeção do browser
             "error": None
         }
         
