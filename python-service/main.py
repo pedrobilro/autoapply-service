@@ -1605,17 +1605,42 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                     log_message(messages, "   • Proxy residencial ativado")
                     log_message(messages, "   • Anti-bot evasion ativado")
                     
-                    # Bright Data não fornece inspect URL automático
-                    # As sessões podem ser vistas no dashboard: https://brightdata.com/cp/zones
-                    inspect_url = f"https://brightdata.com/cp/zones"
-                    log_message(messages, f"🌐 Bright Data ativado - veja sessões ativas em: {inspect_url}")
-                    log_message(messages, "   Nota: Aceda ao dashboard do Bright Data > Zones para monitorizar a sessão")
+                    # Bright Data não fornece inspect URL via API
+                    # As sessões podem ser monitorizadas em: https://brightdata.com/cp/zones
+                    log_message(messages, "🌐 Bright Data proxy ativado")
+                    log_message(messages, f"   📡 Proxy endpoint: {brightdata_username.split('-')[0] if brightdata_username else 'unknown'}")
+                    log_message(messages, "   ℹ️ Monitorize sessões em: https://brightdata.com/cp/zones > Event log")
+                    log_message(messages, "   ⏰ Nota: Pode demorar alguns segundos até aparecer no dashboard")
                     
                     context = await browser.new_context(
                         viewport={'width': 1920, 'height': 1080},
                         user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                     )
                     page = await context.new_page()
+                    
+                    # Testar conexão Bright Data
+                    log_message(messages, "🔍 A testar conexão Bright Data...")
+                    try:
+                        test_response = await page.goto("https://lumtest.com/myip.json", wait_until="domcontentloaded", timeout=30000)
+                        if test_response and test_response.ok:
+                            ip_text = await page.content()
+                            log_message(messages, f"✅ Bright Data conectado! Resposta recebida")
+                            # Tentar extrair IP dos dados
+                            try:
+                                import json
+                                import re
+                                json_match = re.search(r'\{[^}]+\}', ip_text)
+                                if json_match:
+                                    ip_data = json.loads(json_match.group())
+                                    log_message(messages, f"   📍 IP: {ip_data.get('ip', 'unknown')}")
+                                    log_message(messages, f"   🌍 País: {ip_data.get('country', 'unknown')}")
+                            except:
+                                log_message(messages, "   ✅ Conexão verificada (detalhes não disponíveis)")
+                        else:
+                            log_message(messages, "⚠️ Resposta inesperada ao testar Bright Data")
+                    except Exception as test_err:
+                        log_message(messages, f"⚠️ Erro ao testar Bright Data: {test_err}")
+                        log_message(messages, "   Continuando mesmo assim...")
                         
                 except Exception as e:
                     log_message(messages, f"❌ Falha ao conectar Bright Data: {e}")
