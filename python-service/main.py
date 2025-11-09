@@ -1694,7 +1694,29 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
 
             log_message(messages, f"Iniciando candidatura: {job_url}")
             step_start = time.time()
-            await page.goto(job_url, wait_until="domcontentloaded")
+            # Navegação resiliente: evita loops de redirecionamento (Ashby às vezes causa "navigate limit reached")
+            nav_ok = False
+            last_err = None
+            for wait_state in ["commit", "domcontentloaded", "load"]:
+                try:
+                    await page.goto(job_url, wait_until=wait_state, timeout=60000)
+                    nav_ok = True
+                    log_message(messages, f"✓ Página carregada com wait_until='{wait_state}'")
+                    break
+                except Exception as e:
+                    last_err = e
+                    msg = str(e)
+                    if "navigate limit" in msg.lower() or "Page.navigate" in msg:
+                        log_message(messages, f"⚠️ Muitos redirecionamentos ({wait_state}). A tentar fallback...")
+                        # Pequena pausa antes do próximo modo
+                        await asyncio.sleep(0.5)
+                        continue
+                    else:
+                        log_message(messages, f"⚠️ Erro ao navegar ({wait_state}): {e}")
+                        await asyncio.sleep(0.5)
+                        continue
+            if not nav_ok:
+                raise last_err or Exception("Falha ao navegar para a vaga")
             app_logger.log_performance("page_load", time.time() - step_start)
             app_state.current_step = "page_loaded"
             
