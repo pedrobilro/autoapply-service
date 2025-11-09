@@ -1598,9 +1598,30 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
                 log_message(messages, "🌐 Conectando via Bright Data Browser API...")
                 log_message(messages, f"   Username: {brightdata_username[:20]}...")
                 browser_endpoint = f"wss://{brightdata_username}:{brightdata_password}@brd.superproxy.io:9222"
+                
+                # Retry logic para conexão ao Bright Data
+                browser = None
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        log_message(messages, f"   Tentativa {attempt + 1}/3...")
+                        browser = await p.chromium.connect_over_cdp(
+                            browser_endpoint,
+                            timeout=90000  # 90s
+                        )
+                        log_message(messages, "✅ Conectado ao Bright Data Browser API")
+                        break
+                    except Exception as e:
+                        last_err = e
+                        log_message(messages, f"⚠️ Tentativa {attempt + 1} falhou: {str(e)[:100]}")
+                        if attempt < 2:
+                            log_message(messages, "   ⏳ A aguardar antes de nova tentativa...")
+                            await asyncio.sleep(3)
+                
+                if not browser:
+                    raise last_err or Exception("Falha ao conectar ao Bright Data após 3 tentativas")
+                
                 try:
-                    browser = await p.chromium.connect_over_cdp(browser_endpoint)
-                    log_message(messages, "✅ Conectado ao Bright Data Browser API")
                     log_message(messages, "   • CAPTCHA solving automático ativado")
                     log_message(messages, "   • Proxy residencial ativado")
                     log_message(messages, "   • Anti-bot evasion ativado")
@@ -1694,7 +1715,29 @@ async def apply_to_job_async(user_data: Dict[str, str]) -> Dict:
 
             log_message(messages, f"Iniciando candidatura: {job_url}")
             step_start = time.time()
-            await page.goto(job_url, wait_until="domcontentloaded")
+            # Navegação resiliente: evita loops de redirecionamento (Ashby às vezes causa "navigate limit reached")
+            nav_ok = False
+            last_err = None
+            for wait_state in ["commit", "domcontentloaded", "load"]:
+                try:
+                    await page.goto(job_url, wait_until=wait_state, timeout=60000)
+                    nav_ok = True
+                    log_message(messages, f"✓ Página carregada com wait_until='{wait_state}'")
+                    break
+                except Exception as e:
+                    last_err = e
+                    msg = str(e)
+                    if "navigate limit" in msg.lower() or "Page.navigate" in msg:
+                        log_message(messages, f"⚠️ Muitos redirecionamentos ({wait_state}). A tentar fallback...")
+                        # Pequena pausa antes do próximo modo
+                        await asyncio.sleep(0.5)
+                        continue
+                    else:
+                        log_message(messages, f"⚠️ Erro ao navegar ({wait_state}): {e}")
+                        await asyncio.sleep(0.5)
+                        continue
+            if not nav_ok:
+                raise last_err or Exception("Falha ao navegar para a vaga")
             app_logger.log_performance("page_load", time.time() - step_start)
             app_state.current_step = "page_loaded"
             
